@@ -1,0 +1,31 @@
+```{r Import BSseq data}
+require(bsseq)
+require(DSS)
+require(DMRcate)
+
+dmr_folder <- "../0_Original_project/data/analysis/WGBS/07differentialMethylation/"
+fit2 <- readRDS(paste0(dmr_folder, "fit2.rds"))
+colnames(fit2) <- pData(fit2)$Sample
+
+design_mat <- with(pData(fit2), data.frame(SJC, Sex))
+DMLfit <- DMLfit.multiFactor(fit2, design = design_mat, formula=~SJC+Sex)
+DMLtest_SJC <- DMLtest.multiFactor(DMLfit, coef = 2)
+
+#DSS
+dmls_dss <- callDML(DMLtest_SJC)
+dmrs_dss <- callDMR(DMLtest_SJC, minCG = 3)
+
+
+png("22_31076008_31076087.png", width = 800, height = 2500)
+showOneDMR(dmrs_dss[1,], fit2)
+dev.off()
+
+png("22_31076008_31076087_BSseq.png", width = 800, height = 800)
+plotRegion(fit2, dmrs_dss[1,1:3], extend = 500)
+dev.off()
+
+#DMRcate
+wgbsannot <- cpg.annotate("sequencing", DMLtest_SJC)
+wgbs.DMRs <- dmrcate(wgbsanno, lambda = 1000, c = 50, mc.cores = 4)
+
+```

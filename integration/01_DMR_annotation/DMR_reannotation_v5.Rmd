@@ -1,0 +1,433 @@
+---
+title: "Reannotating the DMRs"
+author: "Andrew Y.F. Li Yim"
+date: "June/July 2017"
+output:
+  pdf_document: 
+    highlight: tango
+    number_sections: yes
+    toc: yes
+---
+
+Annotation the DMRs
+===============================
+In this workbook we aim to reannotate the DMRs by associating them to genes on the basis of their overlap with known promoters or enhancers (regulatory features). For the promoters we will use the Ensembl Regulatory Build (v89), while the enhancers will be based on promoter capture Hi-C (pcHi-C) overlayed on top of the Ensembl Regulatory Build (v89). As promoter/enhancer activity is celltype specific, we will confine our reannotation to the celltypes that are were present in both promoter and enhancer datasets, namely: 
+- Monocytes 
+- Macrophages 0
+- Macrophages 1
+- Macrophages 2
+- Neutrophils
+- Erythroblasts
+- CD4 T-cells
+- CD8 T-cells
+
+#Preparation
+```{r Setup}
+data_dir <- file.path("../../data/")
+primary_analyses_dir <- file.path(data_dir, "Primary_analyses")
+DMR_dir <- file.path(data_dir, "Primary_analyses/data/analysis/WGBS/07differentialMethylation/")
+out_dir <- file.path("../../output/01_DMR_annotation")
+dir.create(out_dir)
+
+no_cores <- 6
+```
+
+```{r DMRs}
+HvL_dmrs <- read.csv(file.path(DMR_dir, "HL.dmr.csv"), stringsAsFactors = F)
+HvN_dmrs <- read.csv(file.path(DMR_dir, "HN.dmr.csv"), stringsAsFactors = F)
+LvN_dmrs <- read.csv(file.path(DMR_dir, "LN.dmr.csv"), stringsAsFactors = F)
+
+require(GenomicRanges)
+HvL_dmrs_gr <- makeGRangesFromDataFrame(df = HvL_dmrs, keep.extra.columns = T, seqnames.field = "chr", start.field = "start", end.field = "end")
+HvN_dmrs_gr <- makeGRangesFromDataFrame(df = HvN_dmrs, keep.extra.columns = T, seqnames.field = "chr", start.field = "start", end.field = "end")
+LvN_dmrs_gr <- makeGRangesFromDataFrame(df = LvN_dmrs, keep.extra.columns = T, seqnames.field = "chr", start.field = "start", end.field = "end")
+```
+
+```{r Annotations}
+require(rtracklayer)
+require(ensembldb)
+require(AnnotationDbi)
+require(GenomicFeatures)
+require(org.Hs.eg.db)
+require(ChIPseeker)
+
+hg19tohg38 <- import.chain(file.path(primary_analyses_dir, "data/analysis/WGBS/00correlations/hg19ToHg38.over.chain"))
+
+anno_folder <- file.path(data_dir, "Ensembl/Annotation")
+anno_GRCh37 <- file.path(anno_folder, "Homo_sapiens.GRCh37.75.txdb.db")
+anno_GRCh38 <- file.path(anno_folder, "Homo_sapiens.GRCh38.89.txdb.db")
+
+if(file.exists(anno_GRCh38)){
+	txdb_GRCh38 <- loadDb(anno_GRCh38)
+} else{
+	txdb_GRCh38 <- makeTxDbFromGFF(file.path(anno_folder, "Homo_sapiens.GRCh38.89.gtf"), taxonomyId = 9606)
+	txdb_GRCh38 <- renameSeqlevels(txdb_GRCh38, gsub("^([0-9XY]+)$", "chr\\1", seqlevels(txdb_GRCh38)))
+	saveDb(x = txdb_GRCh38, file = anno_GRCh38)
+}
+if(file.exists(anno_GRCh37)){
+	txdb_GRCh37 <- loadDb(anno_GRCh37)
+} else{
+	txdb_GRCh37 <- makeTxDbFromGFF(file.path(anno_folder, "Homo_sapiens.GRCh37.75.gtf"), taxonomyId = 9606)
+	txdb_GRCh37 <- renameSeqlevels(txdb_GRCh37, gsub("^([0-9XY]+)$", "chr\\1", seqlevels(txdb_GRCh37)))
+	saveDb(x = txdb_GRCh37, file = anno_GRCh37)
+}
+```
+
+#Annotation
+##Enhancers
+To find the overlap between the DMRs and the promoters, we will again utilize ChIPSeeker (Yu et al. 2015). The pcHi-C data is obtained from the Javierre et al. 2016 article, in particular three files were provided by Javierre et al. 2016, namely:
+- PCHiC_peak_matrix_cutoff5.tsv: Contains all the promoter-chromatin interactions with a CHiCAGO score above 5.
+- PCHiC_vs_rCHiC_peak_matrix.tsv: Promoter-chromatin interactions that were technically validated by performing the inverse capture.
+- ActivePromoterEnhancerLinks.tsv: Promoter-chromatin interactions that were also found in the Ensembl Regulatory Build and BLUEPRINT data.
+We will use the "ActivePromoterEnhancerLinks.tsv" dataset in our analyses.
+
+## Importing the enhancers
+```{r Importing and processing the ActivePromoterEnhancerLinks.tsv}
+pcHiC <- read.csv(file.path(data_dir, "Javierre2016/ActivePromoterEnhancerLinks.tsv"), sep = "\t", stringsAsFactors = F)
+
+#The assessed celltypes
+celltypes_assayed <- unique(unlist(strsplit(x = as.character(unique(pcHiC$cellType.s.)), split = ",")))
+
+pcHiC_OE_gr <- makeGRangesFromDataFrame(df = pcHiC, keep.extra.columns = T, seqnames.field = "oeChr", start.field = "oeSt", end.field = "oeEnd")
+seqlevelsStyle(pcHiC_OE_gr) <- "NCBI"
+pcHiC_OE_anno <- as.GRanges(annotatePeak(pcHiC_OE_gr, tssRegion = c(-2500, 250), TxDb = txdb_GRCh37, annoDb = "org.Hs.eg.db"))
+seqlevelsStyle(pcHiC_OE_anno) <- "UCSC"
+pcHiC_OE_anno <- unlist(liftOver(pcHiC_OE_anno, hg19tohg38)) 
+seqlevelsStyle(pcHiC_OE_anno) <- "NCBI"
+pcHiC_OE_anno_df <- as.data.frame(pcHiC_OE_anno)
+pcHiC_OE_anno_df_sub <- pcHiC_OE_anno_df[,c("seqnames", "start", "end", "baitChr", "baitSt", "baitEnd", "annotation", "distanceToTSS", "geneId", "SYMBOL", "cellType.s.")]
+colnames(pcHiC_OE_anno_df_sub) <- c("oeChr_GRCh38", "oeStart_GRCh38", "oeEnd_GRCh38", "baitChr_GRCh37", "baitStart_GRCh37", "baitEnd_GRCh37", "oeAnno", "oeDistTSS", "oeENS", "oeSYMBOL", "celltype")
+
+pcHiC_Bait_gr <- makeGRangesFromDataFrame(df = pcHiC_OE_anno_df_sub, keep.extra.columns = T, seqnames.field = "baitChr_GRCh37", start.field = "baitStart_GRCh37", end.field = "baitEnd_GRCh37")
+seqlevelsStyle(pcHiC_Bait_gr) <- "NCBI"
+pcHiC_Bait_anno <- as.GRanges(annotatePeak(pcHiC_Bait_gr, tssRegion = c(-2500, 250), TxDb = txdb_GRCh37, annoDb = "org.Hs.eg.db"))
+seqlevelsStyle(pcHiC_Bait_anno) <- "UCSC"
+pcHiC_Bait_anno <- unlist(liftOver(pcHiC_Bait_anno, hg19tohg38))
+seqlevelsStyle(pcHiC_Bait_anno) <- "NCBI"
+pcHiC_Bait_anno_df <- as.data.frame(pcHiC_Bait_anno)
+pcHiC_Bait_anno_df_sub <- pcHiC_Bait_anno_df[,c("seqnames", "start", "end", "annotation", "distanceToTSS", "geneId", "SYMBOL","oeChr_GRCh38", "oeStart_GRCh38", "oeEnd_GRCh38", "oeAnno", "oeDistTSS", "oeENS", "oeSYMBOL", "celltype")]
+colnames(pcHiC_Bait_anno_df_sub) <- c("baitChr", "baitStart", "baitEnd", "baitAnno", "baitDistTSS", "baitENS", "baitSYMBOL", "oeChr", "oeStart", "oeEnd", "oeAnno", "oeDistTSS", "oeENS", "oeSYMBOL", "celltype")
+
+pcHiC_GRCh38_OE <- makeGRangesFromDataFrame(df = pcHiC_Bait_anno_df_sub, keep.extra.columns = T, seqnames.field = "oeChr", start.field = "oeStart", end.field = "oeEnd")
+
+#Save for downstream analyses
+pcHiC_dir <- file.path(out_dir, "Enhancers_parsed")
+dir.create(pcHiC_dir)
+write.csv(pcHiC_Bait_anno_df_sub, file.path(pcHiC_dir, "pcHiC_anno_GRCh38.csv"))
+```
+To find the overlap between the DMRs and the promoters, we will utilize ChIPSeeker (Yu et al. 2015). One problem is that for some blood cells, there is only venous blood (VB) or cord blood (CB). A solution is to download both for each dataset and merge the active regions. 
+
+##Promoters
+The promoter data was obtained from Ensembl Regulatory. However, Javierre et al. 2016 had not used the Ensembl Regulatory to generate the baits, as such there are some minor discrepancies that exist between promoters obtained from their data and that in Ensembl Regulatory. In the next chunk, we will generate a lookup table wherein we summarize the promoter data obtained from the two different sources. Promoter regions that are overlapping will be merged into one region. 
+###Importing the promoters
+```{r Ensembl Regulatory}
+promoter_data <- file.path(data_dir, "Ensembl/Regulatory/v89")
+
+ensreg_promoters <- read.csv(file.path(promoter_data, "GRCh38_promoters_biomart.tsv"), stringsAsFactors = F, header = T, sep = "\t")
+ensreg_promoters$Epigenome.name <- gsub("^CD14\\+.+((C|V)B)\\)$", "Mon_\\1", ensreg_promoters$Epigenome.name)
+ensreg_promoters$Epigenome.name <- gsub("^CD4\\+.+((C|V)B)\\)$", "CD4_\\1", ensreg_promoters$Epigenome.name)
+ensreg_promoters$Epigenome.name <- gsub("^CD8\\+.+((C|V)B)\\)$", "CD8_\\1", ensreg_promoters$Epigenome.name)
+ensreg_promoters$Epigenome.name <- gsub("^M0.+((C|V)B)\\)$", "Mac0_\\1", ensreg_promoters$Epigenome.name)
+ensreg_promoters$Epigenome.name <- gsub("^M1.+((C|V)B)\\)$", "Mac1_\\1", ensreg_promoters$Epigenome.name)
+ensreg_promoters$Epigenome.name <- gsub("^M2.+((C|V)B)\\)$", "Mac2_\\1", ensreg_promoters$Epigenome.name)
+ensreg_promoters$Epigenome.name <- gsub("erythro.+((C|V)B)\\)$", "EB_\\1", ensreg_promoters$Epigenome.name)
+ensreg_promoters$Epigenome.name <- gsub("neutro.+((C|V)B)\\)$", "Neu_\\1", ensreg_promoters$Epigenome.name)
+ensreg_promoters <- unique(ensreg_promoters)[,-ncol(ensreg_promoters)]
+colnames(ensreg_promoters) <- c("chr", "start", "end", "Feature_type", "Cell_type", "Activity")
+ensreg_promoters <- ensreg_promoters[ensreg_promoters$Feature_type == "Promoter",]
+
+ensreg_promoters_gr <- keepStandardChromosomes(makeGRangesFromDataFrame(ensreg_promoters, keep.extra.columns = T), pruning.mode = "coarse")
+
+#Add the baits of the promoter capture Hi-C data
+ensreg_promoters_bait <- pcHiC_Bait_anno_df[, c("seqnames", "start", "end")]
+colnames(ensreg_promoters_bait) <- c("chr", "start", "end")
+ensreg_promoters_bait$Feature_type <- "Promoter"
+ensreg_promoters_bait$Cell_type <- pcHiC_Bait_anno_df$celltype
+ensreg_promoters_bait$Activity <- "ACTIVE"
+
+require(dplyr)
+require(tidyr)
+
+ensreg_promoters_bait <- ensreg_promoters_bait %>%
+	mutate(Cell_type = strsplit(as.character(Cell_type), ",")) %>%
+	unnest(Cell_type)
+
+ensreg_promoters_bait <- unique(ensreg_promoters_bait)
+ensreg_promoters_bait <- ensreg_promoters_bait[, c("chr", "start", "end", "Feature_type", "Cell_type", "Activity")]
+ensreg_promoters_bait_gr <- makeGRangesFromDataFrame(ensreg_promoters_bait, keep.extra.columns = T)
+
+ensreg_promoters_merged_gr <- c(ensreg_promoters_gr, ensreg_promoters_bait_gr)
+ensreg_promoters_reduced_gr <- reduce(ensreg_promoters_merged_gr)
+
+red_merge_overlap <- findOverlaps(ensreg_promoters_reduced_gr, ensreg_promoters_merged_gr)
+
+ensreg_promoters_merged_gr <- ensreg_promoters_merged_gr[subjectHits(red_merge_overlap), ]
+mcols(ensreg_promoters_merged_gr)$Group <- queryHits(red_merge_overlap) 
+
+ensreg_promoters_gr_split <- split(ensreg_promoters_merged_gr, as.factor(ensreg_promoters_merged_gr$Group))
+names(ensreg_promoters_gr_split) <- as.factor(ensreg_promoters_reduced_gr)
+```
+
+```{r Annotating the merged promoters}
+ensreg_promoters_anno <- as.GRanges(annotatePeak(ensreg_promoters_reduced_gr, tssRegion = c(-2500, 250), TxDb = txdb_GRCh38, annoDb = "org.Hs.eg.db"))
+
+#Save the parsed promoters for future reference
+promoters_parsed_dir <- file.path(out_dir, "Promoters_parsed")
+dir.create(promoters_parsed_dir)
+saveRDS(ensreg_promoters_gr_split, file.path(promoters_parsed_dir, "ensreg_promoters_gr_activity.Rds"))
+write.csv(as.data.frame(ensreg_promoters_anno), file.path(promoters_parsed_dir, "GRCh38_promoters_blood.csv"))
+```
+We have promoter data of 64148 features, 14325 unique genes.
+
+
+Some enhancers appear to overlap with other enhancers, it is unclear why these hits were not merged.
+```{r Merge overlapping enhancers NOT FINISHED}
+pcHiC_GRCh38_OE_split <- split(pcHiC_GRCh38_OE, pcHiC_GRCh38_OE$oeENS)
+pcHiC_GRCh38_OE_red <- reduce(pcHiC_GRCh38_OE)
+overlapping_enhancers <- data.frame(findOverlaps(query = pcHiC_GRCh38_OE, subject = pcHiC_GRCh38_OE_red))
+overlapping_enhancers_list <- split(overlapping_enhancers, overlapping_enhancers$subjectHits)
+lapply(overlapping_enhancers_list, function(entry){
+	split(entry, entry$oeENS)
+})
+
+```
+###Annotating the DMRs according to location within enhancers
+```{r DMR promoter annotation}
+dm_enhancer_overlap <- function(dmrs, enhancers){
+	dmrs <- keepStandardChromosomes(dmrs, pruning.mode = "coarse")
+	enhancers <- keepStandardChromosomes(enhancers, pruning.mode = "coarse")
+
+	overlapping_ind <- findOverlaps(enhancers, dmrs)
+	dmrs_df <- data.frame(dmrs)[subjectHits(overlapping_ind), c("seqnames", "start", "end", "n", "invdensity", "areaStat", "maxStat", "meanDiff", "group1.mean", "group2.mean", "tstat.sd", "direction")]
+	colnames(dmrs_df) <- c("dmrChr", "dmrStart", "dmrEnd", "nCpGs", "invdensity", "areaStat", "maxStat", "meanDiff", "group1.mean", "group2.mean", "tstat.sd", "direction")
+
+	enhancers_df <- data.frame(enhancers)[queryHits(overlapping_ind), c("seqnames", "start", "end", "oeAnno", "oeDistTSS", "oeENS", "oeSYMBOL", "baitChr", "baitStart", "baitEnd", "baitAnno", "baitDistTSS", "baitENS", "baitSYMBOL", "celltype")]
+	colnames(enhancers_df) <- c("oeChr", "oeStart", "oeEnd", "oeAnno", "oeDistTSS", "oeENS", "oeSYMBOL", "baitChr", "baitStart", "baitEnd", "baitAnno", "baitDistTSS", "baitENS", "baitSYMBOL", "celltype")
+
+	dm_enhancers <- cbind(dmrs_df, enhancers_df)
+
+	dm_enhancers$dmrChr <- gsub("chr", "", dm_enhancers$dmrChr)
+	dm_enhancers$oeChr <- gsub("chr", "", dm_enhancers$oeChr)
+	dm_enhancers$baitChr <- gsub("chr", "", dm_enhancers$baitChr)
+
+	dm_enhancers <- aggregate(celltype~., dm_enhancers, FUN = toString)
+	dm_enhancers$celltype <- gsub(", *", ";", dm_enhancers$celltype)
+
+	return(dm_enhancers)
+}
+
+HvL_dmen <- dm_enhancer_overlap(HvL_dmrs_gr, pcHiC_GRCh38_OE) 
+HvN_dmen <- dm_enhancer_overlap(HvN_dmrs_gr, pcHiC_GRCh38_OE)
+LvN_dmen <- dm_enhancer_overlap(LvN_dmrs_gr, pcHiC_GRCh38_OE)
+
+#Save
+dmenhancer_dir <- file.path(out_dir, "DM_enhancers")
+dir.create(dmenhancer_dir)
+
+write.csv(HvL_dmen, file.path(dmenhancer_dir, "HvL_dmenhancers.csv"))
+write.csv(HvN_dmen, file.path(dmenhancer_dir, "HvN_dmenhancers.csv"))
+write.csv(LvN_dmen, file.path(dmenhancer_dir, "LvN_dmenhancers.csv"))
+```
+
+###Annotating the DMRs according to location within promoters
+```{r DMR promoter annotation}
+dm_promoter_overlap <- function(dmrs, promoters){
+	dmrs <- keepStandardChromosomes(dmrs, pruning.mode = "coarse")
+	promoters <- keepStandardChromosomes(promoters, pruning.mode = "coarse")
+
+	overlapping_ind <- findOverlaps(promoters, dmrs)
+	if(length(overlapping_ind) != 0){
+
+		dmrs_df <- data.frame(dmrs)[subjectHits(overlapping_ind), c("seqnames", "start", "end", "n", "invdensity", "areaStat", "maxStat", "meanDiff", "group1.mean", "group2.mean", "tstat.sd", "direction")]
+		colnames(dmrs_df) <- c("dmrChr", "dmrStart", "dmrEnd", "nCpGs", "invdensity", "areaStat", "maxStat", "meanDiff", "group1.mean", "group2.mean", "tstat.sd", "direction")
+
+		promoters_df <- data.frame(promoters)[queryHits(overlapping_ind), c("seqnames", "start", "end", "distanceToTSS", "geneChr", "geneStart", "geneEnd", "geneId", "SYMBOL")]
+		colnames(promoters_df) <- c("promChr", "promStart", "promEnd", "promDistToTSS", "geneChr", "geneStart", "geneEnd", "geneENS", "geneSYMBOL")
+
+		dm_promoters <- cbind(dmrs_df, promoters_df)
+
+		dm_promoters$dmrChr <- gsub("chr", "", dm_promoters$dmrChr)
+		dm_promoters$promChr <- gsub("chr", "", dm_promoters$promChr)
+		dm_promoters$geneChr <- gsub("chr", "", dm_promoters$geneChr)
+
+		return(dm_promoters)
+	}
+	else{
+		cat("No overlaps were found\n")
+	}
+}
+
+HvL_dm_prom <- dm_promoter_overlap(HvL_dmrs_gr, ensreg_promoters_anno)
+HvN_dm_prom <- dm_promoter_overlap(HvN_dmrs_gr, ensreg_promoters_anno)
+LvN_dm_prom <- dm_promoter_overlap(LvN_dmrs_gr, ensreg_promoters_anno)
+
+#Save the annotated DMRs
+dmpromoters_dir <- file.path(out_dir, "DM_promoters")
+dir.create(dmpromoters_dir)
+
+write.csv(HvL_dm_prom, file.path(dmpromoters_dir, "HvL_dmpromoters.csv"))
+write.csv(HvN_dm_prom, file.path(dmpromoters_dir, "HvN_dmpromoters.csv"))
+write.csv(LvN_dm_prom, file.path(dmpromoters_dir, "LvN_dmpromoters.csv"))
+```
+
+## Cellular overrepresentation
+Cellular overrepresentation analysis: Can we find more DMRs for a particular cell type? On a second thought, this does not make a lot of sense, what would it mean to find more DMRs in the promoters/enhancers for a particular celltype. The interpretability is lost.
+```{r Functions}
+groupwise_fishtest <- function(df){
+	stats <- matrix(ncol = 5, nrow = ncol(df))
+	colnames(stats) <- c("pval", "padj", "lower_CI95", "upper_CI95", "OR")
+	rownames(stats) <- colnames(df)
+	for(i in 1:ncol(df)){
+		fish_res <- fisher.test(data.frame(case = df[,i], control = rowSums(df[, -i])))
+		stats[i, "pval"] <- fish_res$p.value
+		stats[i, "lower_CI95"] <- fish_res$conf.int[1]
+		stats[i, "upper_CI95"] <- fish_res$conf.int[2]
+		stats[i, "OR"] <- fish_res$estimate
+	}
+	stats[,"padj"] <- p.adjust(stats[,"pval"])	
+	return(stats)
+}
+```
+```{r DMpromoter statistics}
+# Separate VB/CB
+HvL_dmprom_cells <- table(unlist(strsplit(as.character(HvL_dmprom$celltype), ";")))
+HvN_dmprom_cells <- table(unlist(strsplit(as.character(HvN_dmprom$celltype), ";")))
+LvN_dmprom_cells <- table(unlist(strsplit(as.character(LvN_dmprom$celltype), ";")))
+BG_prom_cells <- table(unlist(strsplit(as.character(ensreg_actprom_anno$celltype), ";")))
+
+HvLvBG_prom <- groupwise_fishtest(rbind(HvL_dmprom_cells, BG_prom_cells))
+HvNvBG_prom <- groupwise_fishtest(rbind(HvN_dmprom_cells, BG_prom_cells))
+write.csv(HvLvBG_prom, "HvLvBG_prom_fisher.csv") 
+write.csv(HvNvBG_prom, "HvNvBG_prom_fisher.csv")
+
+#Merged VB/CB
+HvL_dmprom_cells_merged <- table(unlist(lapply(strsplit(gsub("_(C|V)B", "", HvL_dmprom$celltype), ";"), unique)))
+HvN_dmprom_cells_merged <- table(unlist(lapply(strsplit(gsub("_(C|V)B", "", HvN_dmprom$celltype), ";"), unique)))
+BG_prom_cells_merged <- table(unlist(lapply(strsplit(gsub("_(C|V)B", "", ensreg_actprom_anno$celltype), ";"), unique)))
+
+HvLvBG_prom_merged <- groupwise_fishtest(rbind(HvL_dmprom_cells_merged, BG_prom_cells_merged))
+HvNvBG_prom_merged <- groupwise_fishtest(rbind(HvN_dmprom_cells_merged, BG_prom_cells_merged))
+write.csv(HvLvBG_prom_merged, "HvLvBG_prom_merged_fisher.csv")
+write.csv(HvNvBG_prom_merged, "HvNvBG_prom_merged_fisher.csv")
+
+```
+```{r DMpromoter statistics}
+HvL_dmen_cells <- table(unlist(strsplit(as.character(HvL_dmen$celltype), ";")))
+HvN_dmen_cells <- table(unlist(strsplit(as.character(HvN_dmen$celltype), ";")))
+LvN_dmen_cells <- table(unlist(strsplit(as.character(LvN_dmen$celltype), ";")))
+LvN_dmen_cells <- c(0, 0, 0, 2, 2, 0, 0, 0, 0) # Bit of a hack, the problem is that the previous function would only return a"2,2"
+BG_dmen_cells <- table(unlist(strsplit(as.character(pcHiC_GRCh38_OE$celltype), ",")))
+
+HvLvBG_perc <- HvL_dmen_cells/BG_dmen_cells*100
+HvNvBG_perc <- HvN_dmen_cells/BG_dmen_cells*100
+LvNvBG_perc <- LvN_dmen_cells/BG_dmen_cells*100
+
+#Hypergeometric test
+HvLvBG_dmen <- rbind(HvL_dmen_cells, BG_dmen_cells)
+HvNvBG_dmen <- rbind(HvN_dmen_cells, BG_dmen_cells)
+LvNvBG_dmen <- rbind(LvN_dmen_cells, BG_dmen_cells)
+
+HvLvBG_dmen_fisher <- groupwise_fishtest(HvLvBG_dmen)
+HvNvBG_dmen_fisher <- groupwise_fishtest(HvNvBG_dmen)
+LvNvBG_dmen_fisher <- groupwise_fishtest(LvNvBG_dmen)
+
+write.csv(HvLvBG_dmen_fisher, "HvLvBG_dmen_fisher.csv")
+write.csv(HvNvBG_dmen_fisher, "HvNvBG_dmen_fisher.csv")
+write.csv(LvNvBG_dmen_fisher, "LvNvBG_dmen_fisher.csv")
+```
+
+## Regulatory region overrepresentation analysis
+In total we find 175, 163, and 330  unique DMRs that associate to promoters, enhancers, and regulators (promoters+enhancers) respectively. Note that 175+163 > 330. The discrepancy is because some DMRs are enhancers to one and promoters to another.
+
+Import the CpG coordinates for reshuffling
+```{r CpG coordinates}
+fit2 <- readRDS(file.path(DMR_dir, "fit2.rds"))
+CpG_locs <- granges(fit2)
+CpG_locs <- keepStandardChromosomes(CpG_locs, pruning.mode = "coarse")
+CpG_locs <- split(CpG_locs, seqnames(CpG_locs))
+
+#Function for a single DMR. To me it makes computationally more sense to permute on a per DMR basis rather than a per bootstrap basis. In the case of the latter, for every iteration, each DMR must be checked against the list of regulators.
+DMR_shuffler_single <- function(dmr, cpgs, B){
+	chro <- paste0(seqnames(dmr))
+	cpgs_chro <- as.data.frame(cpgs[[chro]])
+	nCpGs <- dmr$nCpGs
+	sample_space <- nrow(cpgs_chro)-nCpGs
+	indices <- sample(x = 1:sample_space, size = B, replace = T)
+	randmrs <- data.frame(chr = cpgs_chro[indices, "seqnames"],
+			      start = cpgs_chro[indices, "start"],
+			      end = cpgs_chro[indices+nCpGs, "end"])
+
+	return(randmrs)
+}
+
+#Wrapper function for all DMRs
+require(foreach)
+DMRs_shuffler <- function(dmrs, cpgs, B, cores){
+
+	if(cores > 1){
+		require(parallel)
+		cl <- makeCluster(cores)
+		clusterExport(cl, c("cpgs", "B", "DMR_shuffler_single"), envir = environment())
+		randmrs_list <- parLapply(cl, dmrs, function(dmr){
+			DMR_shuffler_single(dmr, cpgs, B)
+		})
+		stopCluster(cl)
+	} else{
+		#First shuffle each DMR B times
+		randmrs_list <- lapply(dmrs, function(dmr){
+			DMR_shuffler_single(dmr, cpgs, B)		      
+		})
+	}
+
+	#"Transpose" the list to ensure that each iterations is a list in itself containing the randomized dataframe for that particular DMR
+	randmrs_t <- lapply(1:B, function(index){
+		do.call(rbind, lapply(randmrs_list, `[`, index, ))
+	})
+
+	#Convert the df into a GRanges
+	randmrs_gr <- lapply(randmrs_t, makeGRangesFromDataFrame)
+	return(randmrs_gr)
+}
+
+#Calculate the null distribution
+nulldist <- function(randmrs_list_gr, regulators_gr){
+	lapply(randmrs_list_gr, function(randmrs){
+		length(subsetByOverlaps(randmrs, regulators_gr))
+	})
+}
+```
+
+```{r Generating the null distribution - SEEMS TO ME SOMETHING IS WRONG}
+
+total_dmrs <- rbind(HvL_dmrs[, c(1:3, 7)], HvN_dmrs[, c(1:3, 7)], LvN_dmrs[, c(1:3, 7)])
+colnames(total_dmrs) <- c("chr", "start", "end", "nCpGs")
+total_dmrs_gr <- unique(makeGRangesFromDataFrame(total_dmrs, keep.extra.columns = T))
+
+rand_dmrs <- DMRs_shuffler(total_dmrs_gr, CpG_locs, 1000, 4)
+```
+
+
+```{r Promoter}
+unique_promoter_DMRs <- unique(rbind(HvL_dm_prom[, 1:4], HvN_dm_prom[, 1:4], LvN_dm_prom[, 1:4]))
+unique_promoter_DMRs_gr <- makeGRangesFromDataFrame(unique_promoter_DMRs, keep.extra.columns = T, seqnames.field = "dmrChr", start.field = "dmrStart", end.field = "dmrEnd")
+
+nulldist_promdmrs <- unlist(nulldist(rand_dmrs, unique(ensreg_promoters_gr)))
+
+mean(length(unique_promoter_DMRs_gr) <= nulldist_promdmrs)
+
+```
+
+```{r Enhancer}
+unique_enhancer_DMRs <- unique(rbind(HvL_dmen[, 1:4], HvN_dmen[, 1:4], LvN_dmen[, 1:4]))
+unique_enhancer_DMRs_gr <- makeGRangesFromDataFrame(unique_enhancer_DMRs, keep.extra.columns = T, seqnames.field = "dmrChr", start.field = "dmrStart", end.field = "dmrEnd")
+
+nulldist_enhdmrs <- unlist(nulldist(rand_dmrs, unique(pcHiC_GRCh38_OE)))
+
+```
+
+```{r Both}
+unique_regulator_DMRs <- unique(rbind(unique_promoter_DMRs, unique_enhancer_DMRs))
+
+```
+
+

@@ -1,0 +1,399 @@
+---
+title: "Integrating GWAS"
+author: "Andrew Y.F. Li Yim"
+date: "August 2017"
+output:
+  pdf_document:
+      highlight: tango
+          number_sections: yes
+	      toc: yes
+---
+
+```{r Filepaths}
+data_dir <- file.path("../../data")
+output_dir <- file.path("../../output")
+eQTM_analyses_dir <- file.path(output_dir, "02_eQTM_analyses")
+
+#Primary analyses
+primary_analyses_dir <- file.path(data_dir, "Primary_analyses")
+
+#Methylation analyses
+DMR_dir <- file.path(primary_analyses_dir, "data/analysis/WGBS/07differentialMethylation")
+
+#Expression analyses
+exprs_dir <- file.path(primary_analyses_dir, "data/analysis/RNAseq/07countReads")
+degs_dir <- file.path(primary_analyses_dir, "data/analysis/RNAseq/08differentialExpression")
+
+#Parsed regulatory elements
+parsed_promoter_dir <- file.path(output_dir, "01_DMR_annotation/Promoters_parsed")
+parsed_enhancer_dir <- file.path(output_dir, "01_DMR_annotation/Enhancers_parsed")
+
+#Semi-annotated DMRs
+DMenhancer_dir <- file.path(output_dir, "01_DMR_annotation/DM_enhancers")
+DMpromoter_dir <- file.path(output_dir, "01_DMR_annotation/DM_promoters")
+```
+
+```{r aDMRs}
+require(GenomicRanges)
+admr_dir <- file.path(eQTM_analyses_dir, "aDMRs")
+
+admrs <- read.csv(file.path(admr_dir, "aDMRs.csv"), stringsAsFactors = F)[, -1]
+admrs_gr <- makeGRangesFromDataFrame(admrs, keep.extra.columns = T)
+
+dadmrs <- read.csv(file.path(admr_dir, "DE_aDMRs.csv"), stringsAsFactors = F)[, -1] 
+dadmrs_gr <- makeGRangesFromDataFrame(dadmrs, keep.extra.columns = T)
+
+eqtms <- read.csv(file.path(admr_dir, "eQTMs.csv"), stringsAsFactors = F)[, -1]
+eqtms_gr <- makeGRangesFromDataFrame(eqtms, keep.extra.columns = T)
+
+deqtms <- read.csv(file.path(admr_dir, "DeQTMs.csv"), stringsAsFactors = F)[, -1]
+deqtms_gr <- makeGRangesFromDataFrame(deqtms, keep.extra.columns = T)
+```
+
+```{r Expression}
+HvL_degs <- read.csv(file.path(degs_dir, "HL.deg.csv"), stringsAsFactors = F)
+HvL_degs <- HvL_degs[order(HvL_degs$pvalue), ]
+HvL_degs_sig <- HvL_degs[HvL_degs$padj < 0.05, ]
+HvL_degs_sig <- HvL_degs_sig[-unique(which(is.na(HvL_degs_sig), arr.ind = T)[, 1]), ]
+HvL_degs_sig$contrast <- "HvL"
+
+HvN_degs <- read.csv(file.path(degs_dir, "HN.deg.csv"), stringsAsFactors = F)
+HvN_degs <- HvN_degs[order(HvN_degs$pvalue), ]
+HvN_degs_sig <- HvN_degs[HvN_degs$padj < 0.05, ]
+HvN_degs_sig <- HvN_degs_sig[-unique(which(is.na(HvN_degs_sig), arr.ind = T)[, 1]), ]
+HvN_degs_sig$contrast <- "HvN"
+
+LvN_degs <- read.csv(file.path(degs_dir, "LN.deg.csv"), stringsAsFactors = F)
+LvN_degs <- LvN_degs[order(LvN_degs$pvalue), ]
+LvN_degs_sig <- LvN_degs[LvN_degs$padj < 0.05, ]
+LvN_degs_sig <- LvN_degs_sig[-unique(which(is.na(LvN_degs_sig), arr.ind = T)[, 1]), ]
+LvN_degs_sig$contrast <- "LvN"
+
+degs_sig <- rbind(HvL_degs_sig, HvN_degs_sig, LvN_degs_sig)
+degs_sig_symbol <- degs_sig[, c("ENSEMBL", "SYMBOL", "contrast")]
+
+#Enhancers
+enhancers <- read.csv(file.path(parsed_enhancer_dir, "pcHiC_anno_GRCh38.csv"))
+enhancers_oe <- enhancers[, c("oeChr", "oeStart", "oeEnd", "baitENS", "baitSYMBOL")]
+enhancers_oe$regulator <- "enhancer"
+colnames(enhancers_oe) <- c("chr", "start", "end", "ENS", "SYMBOL", "regulator")
+
+#Promoters
+promoters <- read.csv(file.path(parsed_promoter_dir, "GRCh38_promoters_blood.csv"), stringsAsFactors = F)
+promoters_ENS <- promoters[, c("seqnames", "start", "end", "geneId", "SYMBOL")]
+promoters_ENS$regulator <- "promoter"
+colnames(promoters_ENS) <- c("chr", "start", "end", "ENS", "SYMBOL", "regulator")
+
+enhancers_bait <- enhancers[, c("baitChr", "baitStart", "baitEnd", "baitENS", "baitSYMBOL")]
+enhancers_bait$regulator <- "promoter"
+colnames(enhancers_bait) <- c("chr", "start", "end", "ENS", "SYMBOL", "regulator")
+
+promoters_total <- rbind(promoters_ENS, enhancers_bait)
+
+#Regulators
+regulators_gr <- makeGRangesFromDataFrame(rbind(promoters_ENS, enhancers_oe, enhancers_bait), keep.extra.columns = T)
+
+#Find the regulators associated to the DEGs
+deg_reg <- regulators_gr[regulators_gr$ENS %in% unique(degs_sig_symbol$ENS),]
+
+#Find the genetic bodies of the regulators
+require(GenomicFeatures)
+txdb_dir <- file.path(data_dir, "Ensembl/Annotation")
+grch38_txdb <- loadDb(file.path(txdb_dir, "Homo_sapiens.GRCh38.89.txdb.db"))
+
+regulators_genes <- genes(grch38_txdb)[genes(grch38_txdb)$gene_id %in% regulators_gr$ENS, ]
+
+ENStoSYMBOL <- unique(data.frame(mcols(regulators_gr))[, c(1, 2)])
+rownames(ENStoSYMBOL) <- ENStoSYMBOL$ENS
+
+regulators_genes$SYMBOL <- ENStoSYMBOL[regulators_genes$gene_id, "SYMBOL"]
+colnames(mcols(regulators_genes)) <- c("ENS", "SYMBOL")
+regulators_genes$regulator <- "body"
+
+regulators_gr <- keepStandardChromosomes(c(regulators_gr, regulators_genes), pruning.mode = "coarse")
+regulators_noSex_gr <- regulators_gr[!seqnames(regulators_gr) %in% c("X", "Y"),]
+```
+
+The first step in our analysis is to check out which RA-associated SNPs are located within our regions of interest. To this end, we will use the STOPGAP database. RA-associated SNPs will then be expanded by looking for SNPs in high LD (>0.8) after which the overlap will be returned. Note that STOPGAP is annotated using GRCh37, so the loci need to be uplifted to GRCh38.
+```{r STOPGAP 2.5.1 data}
+require(GenomicRanges)
+
+#RA-GWAS
+stopgap_dir <- file.path(data_dir, "STOPGAP2_5_1")
+
+load(file.path(stopgap_dir, "gwas.RData"))
+load(file.path(stopgap_dir, "ld.snps.r2.RData"))
+
+head(gwas.data)
+ra_gwas <- gwas.data[which(gwas.data$msh == "arthritis, rheumatoid"), ]
+
+#LD
+head(ld.snps.r2)
+length(ra_gwas$rsid %in% ld.snps.r2$SNP.gwas)
+ra_gwas_ld <- ld.snps.r2[ld.snps.r2$SNP.gwas %in% ra_gwas$snp_id, ]
+ra_gwas_ld <- ra_gwas_ld[ra_gwas_ld$r2 > 0.8, ]
+ra_gwas_ld$CHR.ld <- gsub("(.*)", "chr\\1", ra_gwas_ld$CHR.ld)
+ra_gwas_ld_gr <- makeGRangesFromDataFrame(ra_gwas_ld, keep.extra.columns = T, seqnames.field = "CHR.ld", start.field = "POS.ld", end.field = "POS.ld")
+names(ra_gwas_ld_gr) <- ra_gwas_ld_gr$SNP.ld
+
+#LiftOver
+require(rtracklayer)
+hg19tohg38 <- import.chain(file.path(primary_analyses_dir, "data/analysis/WGBS/00correlations/hg19ToHg38.over.chain"))
+ra_gwas_ld_gr <- unlist(liftOver(ra_gwas_ld_gr, hg19tohg38))
+seqlevelsStyle(ra_gwas_ld_gr) <- "NCBI"
+
+ra_gwas_ld_df <- data.frame(ra_gwas_ld_gr)[, c("SNP.ld", "seqnames", "start", "REF.ld", "ALT.ld", "SNP.gwas", "POS.gwas", "r2", "AF")]
+colnames(ra_gwas_ld_df) <- c("SNP_ld", "chr_ld", "pos_ld", "ref_ld", "alt_ld", "SNP_gwas", "pos_gwas", "r2", "AF")
+```
+
+Can we find any SNPs located within the actual eQTMs?
+```{r SNPS in DMRs}
+gwas_output_dir <- file.path(output_dir, "06_GWAS_integration")
+dir.create(gwas_output_dir)
+
+SNP_overlapper <- function(dmrs_gr){
+	dmr_gwas_overlap <- findOverlaps(ra_gwas_ld_gr, dmrs_gr) 
+	dmrs_gwas_gr <- dmrs_gr[subjectHits(dmr_gwas_overlap),]
+
+	mcols(dmrs_gwas_gr) <- cbind(mcols(dmrs_gwas_gr), ra_gwas_ld_df[queryHits(dmr_gwas_overlap),])
+
+	return(dmrs_gwas_gr)
+}
+
+#aDMRs
+admrs_gwas_gr <- SNP_overlapper(admrs_gr)
+write.csv(data.frame(admrs_gwas_gr), file.path(gwas_output_dir, "aDMRs_internal_GWAS.csv"))
+
+admrs_gwas_hr <- unique(data.frame(admrs_gwas_gr[,c("ENS", "SYMBOL", "REG", "rho", "rhoCI95_lower", "rhoCI95_upper", "SNP_ld", "ref_ld", "alt_ld")]))
+admrs_gwas_hr <- aggregate(SNP_ld~., admrs_gwas_hr, FUN = toString)
+write.csv(admrs_gwas_hr, file.path(gwas_output_dir, "aDMRs_internal_GWAS_HR.csv"))
+
+admrs_gwas_gr_list <- split(admrs_gwas_gr, as.factor(admrs_gwas_gr))
+
+#DaDMRs
+dadmrs_gwas_gr <- SNP_overlapper(dadmrs_gr)
+write.csv(data.frame(dadmrs_gwas_gr), file.path(gwas_output_dir, "DE_aDMRs_internal_GWAS.csv"))
+
+#eQTMs
+eqtms_gwas_gr <- SNP_overlapper(eqtms_gr)
+write.csv(data.frame(eqtms_gwas_gr), file.path(gwas_output_dir, "eQTMs_internal_GWAS.csv"))
+
+#DeQTMs
+deqtms_gwas_gr <- SNP_overlapper(deqtms_gr)
+write.csv(data.frame(deqtms_gwas_gr), file.path(gwas_output_dir, "DeQTMs_internal_GWAS.csv"))
+```
+Our data suggests that three SNPs were found in three DMRs, one of which was associated to two genes. While interesting, the genes associated to the DMRs were not considered to be differentially expressed. So instead, we broaden our search to look for SNPs in other regulatory regions of the eQTMs.
+
+```{r SNPs in other regulatory elements of the genes associated to aDMRs and eQTMs }
+##Find the RA-SNPs and the ones in LD that are located in the regulatory regions
+snps_in_regulators <- findOverlaps(ra_gwas_ld_gr, regulators_gr)
+regulators_with_snps <- regulators_gr[subjectHits(snps_in_regulators), ]
+mcols(regulators_with_snps) <- cbind(mcols(regulators_with_snps), ra_gwas_ld_df[queryHits(snps_in_regulators), ])
+
+dmr_snp_aggregator <- function(dmrs, snps){
+	list(DMRs = dmrs, SNPs = snps)
+}
+
+#aDMRs
+admrs_snps_gr <- regulators_with_snps[which(regulators_with_snps$ENS %in% admrs_gr$ENS),]
+admrs_snps_gr <- makeGRangesFromDataFrame(unique(as.data.frame(admrs_snps_gr, row.names = NULL)[,-5]), keep.extra.columns = T)
+admrs_snps_gr <- makeGRangesFromDataFrame(aggregate(regulator~., admrs_snps_gr, FUN = toString), keep.extra.columns = T)
+admrs_dmrs_gr <- admrs_gr[which(admrs_gr$ENS %in% regulators_with_snps$ENS),]
+
+##List object
+admrs_snps_gr_list <- split(admrs_snps_gr, admrs_snps_gr$ENS)
+admrs_dmrs_gr_list <- split(admrs_dmrs_gr, admrs_dmrs_gr$ENS)
+admrs_snps_list <- mapply(dmr_snp_aggregator, admrs_dmrs_gr_list, admrs_snps_gr_list, SIMPLIFY = F)
+
+##Dataframe object
+admrs_snps_df <- unique(data.frame(ENS = admrs_snps_gr$ENS, 
+				   SNP = with(admrs_snps_gr, paste0(SNP_ld, " (", regulator, ": ", ref_ld, ">", alt_ld, ")"))))
+admrs_snps_agg <- aggregate(SNP~., admrs_snps_df, FUN = toString)
+admrs_dmrs_df <- data.frame(SYMBOL = admrs_dmrs_gr$SYMBOL, 
+			    ENS = admrs_dmrs_gr$ENS, 
+			    DMR = paste0(as.factor(admrs_dmrs_gr), " (", admrs_dmrs_gr$REG, ")"))
+admrs_dmrs_agg <- aggregate(DMR~., admrs_dmrs_df, FUN = toString)
+
+admrs_snps_summary <- merge(admrs_snps_agg, admrs_dmrs_agg, by.x = "ENS", by.y = "ENS")
+rownames(admrs_snps_summary) <- admrs_snps_summary$ENS
+admrs_snps_summary <- admrs_snps_summary[, c("SYMBOL", "DMR", "SNP")]
+
+write.csv(data.frame(admrs_snps_summary), file.path(gwas_output_dir, "aDMRs_SNPs.csv"))
+
+#DaDMRs
+dadmrs_snps_list <- admrs_snps_list[names(admrs_snps_list) %in% dadmrs_gr$ENS]
+dadmrs_snps_summary <- admrs_snps_summary[rownames(admrs_snps_summary) %in% dadmrs_gr$ENS, ]
+
+#eQTMs
+eqtms_snps_list <- admrs_snps_list[names(admrs_snps_list) %in% eqtms_gr$ENS]
+eqtms_snps_summary <- admrs_snps_summary[rownames(admrs_snps_summary) %in% eqtms_gr$ENS, ]
+
+#DeQTMs
+deqtms_snps_list <- admrs_snps_list[names(admrs_snps_list) %in% deqtms_gr$ENS]
+deqtms_snps_summary <- admrs_snps_summary[rownames(admrs_snps_summary) %in% deqtms_gr$ENS, ]
+
+```
+
+```{r GWAS SNPs vs LD SNPs}
+admrs_gwas <- admrs_snps_gr[admrs_snps_gr$SNP_ld == admrs_snps_gr$SNP_gwas,]
+admrs_ld <- admrs_snps_gr[admrs_snps_gr$SNP_ld != admrs_snps_gr$SNP_gwas,]
+```
+
+
+```{r Visualization of the RA-SNPs in regulatory regions}
+require(GenomicInteractions)
+require(GenomicFeatures)
+require(Gviz)
+
+promoters_gr <- makeGRangesFromDataFrame(promoters_total, keep.extra.columns = T)
+
+enhancers_bait <- makeGRangesFromDataFrame(df = enhancers, keep.extra.columns = T, seqnames.field = "baitChr", start.field = "baitStart", end.field = "baitEnd")
+enhancers_oe <- makeGRangesFromDataFrame(df = enhancers, seqnames.field = "oeChr", start.field = "oeStart", end.field = "oeEnd")
+enhancers_interact <- GenomicInteractions(enhancers_bait, enhancers_oe)
+
+meth_dir <- file.path(primary_analyses_dir, "data/analysis/WGBS/07differentialMethylation")
+meth <- readRDS(file.path(meth_dir, "meth.rds"))
+seqlevelsStyle(meth) <- "NCBI"
+factor_interest <- gsub("^.+\\.", "", colnames(mcols(meth)))
+
+grch38_txdb <- keepStandardChromosomes(grch38_txdb)
+grch38_gr <- genes(grch38_txdb)
+
+require(biomaRt)
+ENSBM <- useEnsembl(biomart = "ensembl", dataset = "hsapiens_gene_ensembl", version = 90)
+ENS2Symbol <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"), filters = "ensembl_gene_id", values = names(grch38_gr), mart = ENSBM)
+ENS2Symbol <- aggregate(hgnc_symbol~., ENS2Symbol, FUN = toString)
+ENS2Symbol$hgnc_symbol <- gsub(", ", ";", ENS2Symbol$hgnc_symbol)
+rownames(ENS2Symbol) <- ENS2Symbol$ensembl_gene_id
+grch38_gr$SYMBOL <- ENS2Symbol[grch38_gr$gene_id, ]$hgnc_symbol
+
+#Gviz
+require(Gviz)
+aDMR_loc_core <- function(chr, start_region, end_region, measure = NULL, flanks = 1000, enh_int, dmrs_gr, snps_gr, prom_gr, gene_name, factor_interest, bm, build = "hg38", col_interaction = "red"){
+
+	options(ucscChromosomeNames = F)
+  if(build == "hg38") {gbuild <- "grch38"}
+
+	#Plotting region
+	eff_start <- start_region-flanks
+	eff_end <- end_region+flanks
+
+	gtrack <- GenomeAxisTrack()
+	#itrack <- IdeogramTrack(genome = build, chromosome = chr)
+	grtrack <- BiomartGeneRegionTrack(biomart = bm, genome = gbuild, chromosome = chr, start = eff_start, end = eff_end, name = "ENS", collapseTranscripts = "meta", transcriptAnnotation = "symbol")
+	enhtrack <- InteractionTrack(enh_int, chromosome = chr, name = "Enh")
+	displayPars(enhtrack) = list(anchor.height = 0.1,
+				     col.interactions = col_interaction)
+	if(!is.null(measure)){
+		displayPars(enhtrack) = list(interaction.dimension = "height",
+					     interaction.measure = measure)
+	}
+
+	promtrack <- AnnotationTrack(reduce(prom_gr), chromosome = chr, start = eff_start, end = eff_end, name = "Prom", stacking = "dense")
+	methtrack <- AnnotationTrack(reduce(dmrs_gr), chromosome = chr, start = eff_start, end = eff_end, name = "DMR")
+	snptrack <- AnnotationTrack(reduce(snps_gr), chromosome = chr, start = eff_start, end = eff_end, name = "RA-SNPs")
+	
+	tracklist <- list(gtrack, grtrack, enhtrack, promtrack, methtrack, snptrack) 
+	
+	plotTracks(trackList = tracklist, from = eff_start, to = eff_end, name = name, cex.title = 0.75, cex.axis = 0.75, cex.legend = 0.75, fontcolor = "black")
+}
+
+aDMR_viz <- function(ENS, dmr_snps_gr, factor_interest){
+	#Find the plotting range to show the DMR, the gene and the regulatory region
+	##Gene
+	gene_features <- range(subsetByOverlaps(regulators_gr, dmr_snps_gr), ignore.strand = T)
+	gene_coords <- grch38_gr[grch38_gr$gene_id == ENS,]
+	gene_symbol <- ENS2Symbol[ENS, ]$hgnc_symbol
+	plot_coords <- range(c(range(gene_features), range(gene_coords)), ignore.strand = T)
+
+	#I know there is a function that flattens the GRanges object, I just cannot come up with it at the moment
+	plot_chr <- as.character(seqnames(plot_coords))
+	plot_start <- start(plot_coords)
+	plot_end <- end(plot_coords)
+	plot_flanks <- round(width(plot_coords)/5)
+
+	#Filter enhancers_interact for the genes of interest
+	enhancers_goi <- enhancers_interact[which(mcols(enhancers_interact)$anchor1.baitENS == ENS),]
+
+	pdf(paste0(gene_symbol, ".pdf"), width = 8, height = 4)
+	aDMR_loc_core(chr = plot_chr, 
+		      start_region = plot_start, 
+		      end_region = plot_end, 
+		      enh_int = enhancers_goi, 
+		      prom_gr = promoters_gr, 
+		      bm = ENSBM, 
+		      gene_name = gene_symbol, 
+		      factor_interest = factor_interest, 
+		      snps_gr = ra_gwas_ld_gr, 
+		      dmrs_gr = admrs_gr, 
+		      flanks = plot_flanks) 
+	dev.off()
+}
+
+gwas_plot_dir <- file.path(gwas_output_dir, "genome_plots")
+dir.create(gwas_plot_dir)
+
+cur_dir <- getwd()
+
+setwd(gwas_plot_dir)
+#aDMR_viz(ENS = names(admrs_snps_list)[1], dmr_snps_gr = admrs_snps_list[[1]]$SNPs, factor_interest = factor_interest)
+
+#Regulatory SNPs
+deqtms_ens <- names(deqtms_snps_list)
+for(i in length(deqtms_ens)){
+	aDMR_viz(ENS = deqtms_ens[i], dmr_snps_gr = admrs_snps_list[[deqtms_ens[i]]]$SNPs, factor_interest = factor_interest)
+}
+
+
+```
+
+```{r DMR with internal SNPs}
+internal_SNP_dir <- file.path(gwas_plot_dir, "internal_SNPs")
+dir.create(internal_SNP_dir)
+
+aDMR_SNP_core <- function(meth, enh_int, dmrs_gr, snps_gr, prom_gr, gene_name, factor_interest, bm, build = "hg38", col_interaction = "red"){
+	meth_gr <- subsetByOverlaps(meth, dmrs_gr)
+
+	options(ucscChromosomeNames = F)
+  if(build == "hg38") {gbuild <- "grch38"}
+
+	gtrack <- GenomeAxisTrack()
+	#itrack <- IdeogramTrack(genome = build, chromosome = chr)
+	grtrack <- BiomartGeneRegionTrack(biomart = bm, genome = gbuild, chromosome = as.character(seqnames(dmrs_gr)), start = start(dmrs_gr), end = end(dmrs_gr), name = "ENS", collapseTranscripts = "meta", transcriptAnnotation = "symbol")
+	enhtrack <- InteractionTrack(enh_int, chromosome = as.character(seqnames(dmrs_gr)), name = "Enh")
+	displayPars(enhtrack) = list(anchor.height = 0.1,
+				     col.interactions = col_interaction)
+
+	promtrack <- AnnotationTrack(reduce(prom_gr), chromosome = as.character(seqnames(dmrs_gr)), start = start(dmrs_gr), end = end(dmrs_gr), name = "Prom", stacking = "dense")
+	#methtrack <- AnnotationTrack(reduce(dmrs_gr), chromosome = as.character(seqnames(dmrs_gr)), start = start(dmrs_gr), end = end(dmrs_gr), name = "DMR")
+	methtrack <- DataTrack(meth_gr, groups = factor_interest, type = c("a", "p", "confint"), ylim = c(0,1), legend = T)
+	snptrack <- AnnotationTrack(reduce(snps_gr), chromosome = as.character(seqnames(dmrs_gr)), start = start(dmrs_gr), end = end(dmrs_gr), name = "RA-SNPs")
+	
+	tracklist <- list(gtrack, grtrack, enhtrack, promtrack, methtrack, snptrack) 
+	
+	plotTracks(trackList = tracklist, from = start(dmrs_gr), to = end(dmrs_gr), name = name, cex.title = 0.75, cex.axis = 0.75, cex.legend = 0.75, fontcolor = "black")
+}
+
+lapply(unique(admrs_gwas_gr), function(admr){
+	pdf(file.path(internal_SNP_dir, gsub(":", "_", paste0(as.character(as.factor(admr)), ".pdf"))), width = 8, height = 4)
+	aDMR_SNP_core(meth = meth, enh_int = enhancers_interact, dmrs_gr = admr, snps_gr = ra_gwas_ld_gr, prom_gr = promoters_gr, factor_interest = factor_interest, bm = ENSBM)
+	dev.off()
+})
+
+
+#Internal SNPs
+for(i in length(unique(admrs_gwas_gr))){
+	aDMR_viz(unique(admrs_gwas_gr)[i,]$ENS, dmr_snps_gr = unique(admrs_gwas_gr)[i,], factor_interest = factor_interest)
+}
+setwd(cur_dir)
+
+```
+
+
+The second step is the overrepresentation analysis of the RA-associated SNPs. We will utilize the Ensembl Variant database (v89), which contains common variants from dbSNP, 1000 genomes and HAPMAP. 
+```{r Overrepresentation analysis - Tentative}
+require("VariantAnnotation")
+ensvar_dir <- "../../../../data/ensembl_variation/"
+ensvar <- readVcf(file.path(ensvar_dir, "Homo_sapiens.vcf"), "GRCh38")
+
+```

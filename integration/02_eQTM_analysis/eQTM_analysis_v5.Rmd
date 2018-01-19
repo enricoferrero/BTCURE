@@ -1,0 +1,1111 @@
+---
+title: "eQTM: Correlating methylation and expression"
+author: "Andrew Y.F. Li Yim"
+date: "June/July 2017"
+output:
+  pdf_document: 
+    highlight: tango
+    number_sections: yes
+    toc: yes
+---
+
+Step 1.2 Expression Quantitative Trait Methylation Analysis
+===============================
+In this workbook we aim to perform an expression quantitative trait methylation analysis, which we seek to perform by correlating the DMRs with the expression of the genes associated in step 1.1. The approach implemented here is to calculate the average Beta per DMR per sample obtained from the WGBS data and to correlate this value with the smoothed count data obtained from the RNAseq data for the samples that were present in both experiments. To prevent outliers from influencing our data too much, we will calculate the ranked Pearson correlation coefficient (aka Spearman correlation).
+
+# Importing the annotations
+Change the DMenhancer_dir and DMpromoter_dir if necessary to reflect the most up to date annotations. 
+```{r Folders}
+work_dir <- "/home/al580162/projects/BTCURE/"
+DMenhancer_dir <- paste0(work_dir, "1_Reannotate_DMRs/Results/Annotations/Enhancers/170907") 
+DMpromoter_dir <- paste0(work_dir, "1_Reannotate_DMRs/Results/Annotations/Promoters/170830")
+
+#EPI server
+dmr_folder <- paste0(work_dir, "0_Original_project_local/WGBS")
+exprs_folder <- paste0(work_dir, "0_Original_project_local/RNAseq")
+
+#CB servers
+dmr_folder <- paste0(work_dir, "0_Original_project/data/analysis/WGBS/07differentialMethylation")
+exprs_folder <- paste0(work_dir, "0_Original_project/data/analysis/RNAseq/07countReads")
+
+```
+
+## Importing the differentially methylated enhancers
+```{r Importing the DMenhancers}
+require(GenomicRanges)
+
+HvL_dmrs_enhancers <- read.csv(file.path(DMenhancer_dir, "HvL_dmenhancers.csv"), stringsAsFactors = F)[, -1] 
+HvL_dmrs_enhancers$dmrChr <- gsub("chr", "", as.character(HvL_dmrs_enhancers$dmrChr))
+HvL_dmrs_enhancers$contrast <- "HvL"
+
+LvN_dmrs_enhancers <- read.csv(file.path(DMenhancer_dir, "LvN_dmenhancers.csv"), stringsAsFactors = F)[, -1]
+LvN_dmrs_enhancers$dmrChr <- gsub("chr", "", as.character(LvN_dmrs_enhancers$dmrChr))
+LvN_dmrs_enhancers$contrast <- "LvN"
+
+HvN_dmrs_enhancers <- read.csv(file.path(DMenhancer_dir, "HvN_dmenhancers.csv"), stringsAsFactors = F)[, -1]
+HvN_dmrs_enhancers$dmrChr <- gsub("chr", "", as.character(HvN_dmrs_enhancers$dmrChr))
+HvN_dmrs_enhancers$contrast <- "HvN"
+
+dm_enhancers <- rbind(HvL_dmrs_enhancers, LvN_dmrs_enhancers, HvN_dmrs_enhancers) 
+dm_enhancers$celltype <- gsub(", *", ";", dm_enhancers$celltype)
+dm_enhancers_gr <- keepStandardChromosomes(makeGRangesFromDataFrame(dm_enhancers, keep.extra.columns = T, seqnames.field = "dmrChr", start.field = "dmrStart", end.field = "dmrEnd"))
+
+#Summary statistics
+length(unique(dm_enhancers_gr))
+length(unique(dm_enhancers_gr$baitENS))
+
+```
+
+## Importing the differentially methylated promoters
+```{r Importing the DMpromoters}
+HvL_dmrs_promoters <- read.csv(file.path(DMpromoter_dir, "HvL_dmpromoters.csv"), stringsAsFactors = F)[, -1]
+HvL_dmrs_promoters$dmrChr <- gsub("chr", "", as.character(HvL_dmrs_promoters$dmrChr))
+HvL_dmrs_promoters$contrast <- "HvL"
+
+HvN_dmrs_promoters <- read.csv(file.path(DMpromoter_dir, "HvN_dmpromoters.csv"), stringsAsFactors = F)[, -1]
+HvN_dmrs_promoters$dmrChr<- gsub("chr", "", as.character(HvN_dmrs_promoters$dmrChr))
+HvN_dmrs_promoters$contrast <- "HvN"
+
+dm_promoters <- rbind(HvL_dmrs_promoters, HvN_dmrs_promoters)
+dm_promoters$celltype <- gsub(", *", ";", dm_promoters$celltype)
+dm_promoters_gr <- keepStandardChromosomes(makeGRangesFromDataFrame(dm_promoters, keep.extra.columns = T, seqnames.field = "dmrChr", start.field = "dmrStart", end.field = "dmrEnd"))
+
+#Summary statistics
+length(unique(dm_promoters_gr))
+length(unique(dm_promoters_gr$geneENS))
+```
+
+```{r Making one big GRanges object of all unique DMRegulators}
+dm_enhancers_gr_unified <- dm_enhancers_gr[, c("baitENS", "baitSYMBOL", "nCpGs", "direction")]
+colnames(mcols(dm_enhancers_gr_unified)) <- c("ENS", "SYMBOL", "nCpGs", "direction")
+dm_enhancers_gr_unified$REG <- "Enhancer"
+
+dm_promoters_gr_unified <- dm_promoters_gr[, c("geneENS", "geneSYMBOL", "nCpGs", "direction")]
+colnames(mcols(dm_promoters_gr_unified)) <- c("ENS", "SYMBOL", "nCpGs", "direction")
+dm_promoters_gr_unified$REG <- "Promoter"
+
+admrs <- c(dm_enhancers_gr_unified, dm_promoters_gr_unified) 
+admrs <- makeGRangesFromDataFrame(unique(data.frame(admrs)), keep.extra.columns = T)
+```
+
+Some DMRs were found through different contrasts refer to the same region. This is evident when looking at the region of the DMR and the associated gene. This will muddle our analyses later on and a reasonable approach would be to merge the yielding the largest DMR.
+```{r Merge DMRs obtained from different contrasts}
+admrs_2 <- admrs
+elementMetadata(admrs_2) <- with(data.frame(elementMetadata(admrs_2)), paste(ENS, SYMBOL, direction, REG, sep = "_"))
+
+admrs_merged_list <- reduce(split(admrs_2, elementMetadata(admrs_2)$X))
+admrs_merged <- unlist(admrs_merged_list, use.names = F)
+elementMetadata(admrs_merged)$ENS <- rep(gsub("(ENSG.+)_.+_.+_.+", "\\1", names(admrs_merged_list)), elementNROWS(admrs_merged_list)) 
+elementMetadata(admrs_merged)$SYMBOL <- rep(gsub("ENSG.+_(.+)_.+_.+", "\\1", names(admrs_merged_list)), elementNROWS(admrs_merged_list)) 
+elementMetadata(admrs_merged)$direction <- rep(gsub("ENSG.+_.+_(.+)_.+", "\\1", names(admrs_merged_list)), elementNROWS(admrs_merged_list)) 
+elementMetadata(admrs_merged)$REG <- rep(gsub("ENSG.+_.+_.+_(.+)", "\\1", names(admrs_merged_list)), elementNROWS(admrs_merged_list)) 
+
+
+#You can choose here whether to use the separate or merged aDMRs
+#admrs_gr <- admrs
+admrs_gr <- admrs_merged
+admrs_gr <- admrs_gr[order(admrs_gr$SYMBOL), ]
+
+#Merge the "direction" tab
+admrs_gr <- makeGRangesFromDataFrame(aggregate(direction~., as.data.frame(admrs_gr), FUN = toString), keep.extra.columns = T)
+admrs_gr$direction <- gsub(", ", ";", admrs_gr$direction)
+
+write.csv(as.data.frame(admrs_gr), "aDMRs_annotation.csv")
+
+#Unique ranges to prevent redoing aggregation of the same aDMR (which might happen if an aDMR associates to a promiscuous regulator).
+admrs_unique <- unique(admrs_gr)
+
+```
+
+# Preparing the methylation data
+## Importing the BSSeq data
+The data imported and processed previously were based on the DMR coordinates, for the purpose of correlation we will need to extract the Beta value for each CpG comprising the DMR. As the actual matrix of all Beta values will be very large, best is to subset the data else the averaging might choke up.
+```{r Importing the BSSeq data}
+require(bsseq)
+
+fit2 <- readRDS(file.path(dmr_folder, "fit2.rds"))
+fit2 <- keepStandardChromosomes(fit2, pruning.mode = "coarse")
+colnames(fit2) <- pData(fit2)$Sample
+
+#Colours for later on
+gg_color_hue <- function(n){
+	hues <- seq(15, 375, length = n + 1)
+	hcl(h = hues, l = 65, c = 100)[1:n]
+}
+
+swelling_cols <- gg_color_hue(length(unique(pData(fit2)$Swelling)))
+names(swelling_cols) <- unique(pData(fit2)$Swelling)
+
+fit2$col <- swelling_cols[pData(fit2)$Swelling]
+
+fit2_admrs <- subsetByOverlaps(fit2, admrs_unique)
+```
+
+##Averaging the DMRs
+```{r Averaging the Betas per DMR per sample}
+require(parallel)
+no_cores <- 6 
+
+dmr_beta_mean <- function(dmr_gene, methylation, ...){
+     if(is.null(dmr_gene)) stop("No GRanges object with DMRs provided")
+     if(is.null(methylation)) stop("No GRanges object with methylation data provided")
+
+     dmr_chr <- gsub(pattern = "chr", replacement = "", x = as.character(seqnames(dmr_gene)), ignore.case = T)
+
+     meth_chr <- as.character(seqnames(methylation))
+     meth_pos <- start(methylation)
+
+     if(class(methylation) == "BSseq"){
+          betas <- bsseq::getMeth(methylation[which(meth_chr == dmr_chr & meth_pos >= start(dmr_gene) & meth_pos <= end(dmr_gene)), ], type = "raw")
+     } else if(class(methylation) == "GenomicRanges"){
+          betas <- methylation[which(meth_chr == dmr_chr & meth_pos >= start(dmr_gene) & meth_pos <= end(dmr_gene)), ]
+          betas <- as.data.frame(betas)
+     } else stop("The methylation matrix must be a GRanges(-derived) object")
+     betas <- colMeans(betas, na.rm = T)
+     return(betas)
+}
+```
+
+```{r Averaging the DMRs}
+gc()
+cl <- makeCluster(no_cores)
+clusterExport(cl, c("dmr_beta_mean", "fit2_admrs"))
+clusterEvalQ(cl, c(library(GenomicRanges),
+		   library(bsseq)))
+admr_mean <- parLapply(cl = cl, X = admrs_unique, fun = function(dmr){dmr_beta_mean(dmr_gene = dmr, methylation = fit2_admrs)})
+stopCluster(cl)
+gc()
+
+admr_mean_df <- data.frame(matrix(unlist(admr_mean), ncol = ncol(fit2_admrs), byrow = T))
+rownames(admr_mean_df) <- paste0(seqnames(admrs_unique), ":", start(admrs_unique), "-", end(admrs_unique))
+colnames(admr_mean_df) <- pData(fit2_admrs)$Sample
+
+na_dm_indices <- which(is.na(admr_mean_df), arr.ind = T)[,1]
+if(length(na_dm_indices) != 0){
+	admr_mean_df <- admr_mean_df[-na_dm_indices, ]
+}
+admr_mean_df$chr <- gsub("(.+):.+-.+", "\\1", rownames(admr_mean_df))
+admr_mean_df$start <- gsub(".+:(.+)-.+", "\\1", rownames(admr_mean_df))
+admr_mean_df$end <- gsub(".+:.+-(.+)", "\\1", rownames(admr_mean_df))
+admr_mean_gr <- makeGRangesFromDataFrame(admr_mean_df, keep.extra.columns = T, seqnames.field = "chr", start.field = "start", end.field = "end")
+
+#Filter the annotations by the aggregations that we could find
+admrs_culled <- subsetByOverlaps(admrs_gr, admr_mean_gr)
+```
+
+# Preparing the expression data
+## Importing the RNASeq data
+```{r Importing the RNASeq data}
+raw_expr_data <- read.csv(file.path(exprs_folder, "counts.txt"), sep = "\t")
+#colnames(expr_data) <- gsub("\\.", "-", colnames(expr_data))
+#expr_data <- read.csv(file.path(exprs_folder, "normCounts4.txt"), sep = "\t")
+#colnames(expr_data) <- gsub("\\.", "-", colnames(expr_data))
+expr_data <- read.csv(file.path(work_dir, "1_Reannotate_DMRs/Data/RNAseq/rld.csv"), row.names = 1)
+colnames(expr_data) <- gsub("(RA)\\.([0-9]+).+", "\\1-\\2", colnames(expr_data))
+
+expr_data <- expr_data[which(rowSums(expr_data) != 0), ]
+
+HvL_degs <- read.csv(file.path(exprs_folder, "../08differentialExpression/HL.deg.csv"), stringsAsFactors = F)
+HvL_degs <- with(HvL_degs, HvL_degs[order(pvalue), ])
+HvL_degs_sig <- HvL_degs[HvL_degs$padj < 0.05, ]
+HvL_degs_sig <- HvL_degs_sig[-unique(which(is.na(HvL_degs_sig), arr.ind = T)[, 1]), ]
+
+HvN_degs <- read.csv(file.path(exprs_folder, "../08differentialExpression/HN.deg.csv"), stringsAsFactors = F)
+HvN_degs <- with(HvN_degs, HvN_degs[order(pvalue), ])
+HvN_degs_sig <- HvN_degs[HvN_degs$padj < 0.05, ]
+HvN_degs_sig <- HvN_degs_sig[-unique(which(is.na(HvN_degs_sig), arr.ind = T)[, 1]), ]
+
+LvN_degs <- read.csv(file.path(exprs_folder, "../08differentialExpression/LN.deg.csv"), stringsAsFactors = F)
+LvN_degs <- with(LvN_degs, LvN_degs[order(pvalue), ])
+LvN_degs_sig <- LvN_degs[LvN_degs$padj < 0.05, ]
+LvN_degs_sig <- LvN_degs_sig[-unique(which(is.na(LvN_degs_sig), arr.ind = T)[, 1]), ]
+
+unique_deg_symbols <- unique(c(HvL_degs_sig$ENSEMBL, HvN_degs_sig$ENSEMBL, LvN_degs_sig$ENSEMBL))
+```
+
+# Perform the eQTM analysis
+## eQTM analysis
+```{r eQTM analysis}
+require(boot)
+require(parallel)
+
+#The reason the correlator core is separate from the bootstrapper and the permuter is because the bootstrapper function can be parallelized using parLapply
+correlator_core <- function(dmr_data, expr_data, dmr_gene_anno, id_col_name, meth_data, iterations, cor_type = c("pearson", "kendall", "spearman"), ncores = 1, seed = NULL){
+	#dmr_data: A GRanges object whose coordinates correspond to the coordinates of the DMR and whose metadata represents the aggregated methylation value per sample. Can be generated using the dmr_beta_mean.
+	#expr_data: A dataframe containing transcription with a transcript/gene identifier as row names and sample names as column names. Note that the sample names must overlap with the sample names of dmr_data.
+	#dmr_gene_anno: A GRanges object whose coordinates correspond to the coordinates of the DMR and whose metadata contains a column containing the transcript/gene identifier associated to the DMR.
+	#id_col_name: The name of the metadata column of dmr_gene_anno that contains the transcript/gene identifier.
+	#meth_data: A GRanges(-derived) object (such as BSseq) necessary for the permutation analysis 
+	#iterations: An integer representing the number of bootstraps and permutations to perform.
+	#cor_type: A string representing which type of correlation to calculate ("pearson", "spearman", "kendall").
+	#ncores: An integer representing the number of cores to use for parallelization. Defaults to the singlecore implementation.
+	#seed: A value to seed the randomization process. Used for reproducibility purposes.
+
+	if(is.null(dmr_data)) stop("dmr_data cannot be found")
+	if(class(dmr_data) != "GRanges") stop("dmr_data must be a GRanges object")
+	if(is.null(expr_data)) stop("expr_data cannot be found")
+	if(!any(colnames(mcols(dmr_data)) %in% colnames(expr_data))) stop("There exists no overlap between the samples present in dmr_data and expr_data as evident from the column names")
+	if(is.null(id_col_name)) stop("id_col_name cannot be found")
+	if(is.null(meth_data)) stop("meth_data cannot be found")
+	if(!class(meth_data) %in% c("BSseq", "GRanges")) stop("meth_data must be a GRanges or BSseq object")
+	if(is.null(iterations)) stop("iterations cannot be found")
+
+	iterations <- round(iterations)
+	cor_type <- match.arg(cor_type)
+
+	if(!is.numeric(ncores)) stop("ncores must be a numeric")
+	if(ncores > 1){
+		cat(paste0("Parallelization will be implemented using ", ncores, " cores.\n"))
+		#Parallelization under UNIX environments works better if forked (better memory management). However, forking is not an option under windows
+		if(Sys.info()['sysname'] != "Windows"){
+			cl_type <- "FORK"
+		} else{
+			cl_type <- "PSOCK"
+		}
+	} else cat(paste0("Computation will be performed on a single core.\n"))
+
+	#Basic QC expression
+	expr_data <- expr_data[rowSums(expr_data) != 0, ]
+
+	#Find overlapping samples
+	dmr_samples <- as.character(colnames(mcols(dmr_data)))
+	expr_samples <- as.character(colnames(expr_data))
+	overlapping_samples <- intersect(dmr_samples, expr_samples)
+
+	#Find DMR-annotations for which aggregated methylation values exist
+	overlapping_dmr_gene_anno <- subsetByOverlaps(dmr_gene_anno, dmr_data)
+	#Find overlapping transcription features
+	overlapping_dmr_gene_anno <- overlapping_dmr_gene_anno[mcols(overlapping_dmr_gene_anno)[, id_col_name] %in% rownames(expr_data), ]
+
+	dmr_data_culled <- dmr_data[, overlapping_samples]
+	expr_data_culled <- expr_data[, overlapping_samples]
+	
+	cat("Pulling up Baron Munchausen by his bootstraps\n")
+	if(ncores == 1){
+		if(!is.null(seed)) set.seed(seed)
+		correlations <- sapply(X = overlapping_dmr_gene_anno, simplify = T, USE.NAMES = F, FUN = function(dmr_gene_entry){
+			cor_df <- data.frame(meth = as.vector(unlist(mcols(subsetByOverlaps(dmr_data_culled, dmr_gene_entry)))),
+					     expr = as.vector(unlist(expr_data_culled[unlist(mcols(dmr_gene_entry[, id_col_name])), ])))
+			ci_bootstrapper(cor_df = cor_df, iterations = iterations, cor_type = cor_type)
+		})
+	} else{
+		cl <- makeCluster(spec = ncores, type = cl_type)
+		clusterExport(cl, c("dmr_data_culled", "id_col_name", "iterations", "cor_type", "ci_bootstrapper"), envir = environment())
+		clusterEvalQ(cl, library(boot))
+		if(!is.null(seed)) clusterSetRNGStream(cl = cl, iseed = seed)
+			      
+		correlations <- parSapply(cl = cl, X = overlapping_dmr_gene_anno, simplify = T, USE.NAMES = F, FUN = function(dmr_gene_entry){
+			cor_df <- data.frame(meth = as.vector(unlist(mcols(subsetByOverlaps(dmr_data_culled, dmr_gene_entry)))),
+					     expr = as.vector(unlist(expr_data_culled[unlist(mcols(dmr_gene_entry[, id_col_name])), ])))
+			ci_bootstrapper(cor_df = cor_df, iterations = iterations, cor_type = cor_type)
+		})
+		stopCluster(cl)
+		gc()
+	}
+		
+	correlations <- t(correlations)
+
+	correlations_df <- cbind(data.frame(overlapping_dmr_gene_anno), correlations)
+	correlations_gr <- makeGRangesFromDataFrame(correlations_df, keep.extra.columns = T)
+	correlations_gr$nCpGs <- countOverlaps(correlations_gr, meth_data)
+
+	return(correlations_gr)
+}
+
+ci_bootstrapper <- function(cor_df, iterations, cor_type){
+	#Bootstraps for the CI
+	eqtm_correlator <- function(df, indices){
+		return(cor(df[indices, "meth"], df[indices, "expr"], method = cor_type)) 
+	}
+	boot_results <- boot(cor_df, eqtm_correlator, R = iterations, stype = "i")
+	CI95 <- boot.ci(boot_results, type = "bca")
+
+	return(c(rho = boot_results$t0, rhoCI95_lower = CI95$bca[4], rhoCI95_upper = CI95$bca[5]))
+}
+
+pval_permuter <- function(correlations_gr, meth_data, expr_data, iterations = 1000, alternative = c("two.sided", "greater", "less"), id_col_name, cor_type, ncores = 1, seed = NULL){
+	if(is.null(correlations_gr)) stop("correlations_gr cannot be found")
+	if(class(correlations_gr) != "GRanges") stop("correlations_gr must be a GRanges object")
+	if(is.null(meth_data)) stop("meth_data cannot be found")
+	if(!class(meth_data) %in% c("BSseq", "GRanges")) stop("meth_data must be a GRanges or BSseq object")
+	if(is.null(colnames(meth_data))) stop("meth_data must have sample names as column names")
+	if(is.null(expr_data)) stop("expr_data cannot be found")
+	if(is.null(id_col_name) | !id_col_name %in% colnames(mcols(correlations_gr))) stop("Cannot find the expression ID column in correlations_gr")
+	if(is.null(cor_type)) stop("cor_type cannot be found")
+	if(!is.numeric(ncores)) stop("cores must be a numeric")
+	if(ncores > 1){
+		#Parallelization under UNIX environments works better if forked (better memory management). However, forking is not an option under windows
+		if(Sys.info()['sysname'] != "Windows"){
+			cat("Parallelization using FORK\n")
+			cl_type <- "FORK"
+		} else{
+			cat("Parallelization using PSOCK\n")
+			cl_type <- "PSOCK"
+		}
+	}
+	
+	overlapping_samples <- intersect(colnames(meth_data), colnames(expr_data))
+	if(length(overlapping_samples) == 0 ) stop("No overlapping samples found for meth_data and expr_data")
+
+	## Generate null distribution
+	permutation_df <- unique(data.frame(chr = as.character(seqnames(correlations_gr)),
+				     CpGs = correlations_gr$nCpGs))
+	permutation_df <- permutation_df[order(permutation_df$chr, permutation_df$CpGs), ]
+	chromosome_list <- with(permutation_df, split(permutation_df, chr))
+
+	#Split per chromosome for computational purposes
+	permuted_cor <- lapply(names(chromosome_list), function(chromosome){
+		cat(paste0("Starting on chromosome ", chromosome, ".\n"))   
+		chr_data <- meth_data[which(seqnames(meth_data) == chromosome), ]
+		
+		dmr_length <- chromosome_list[[chromosome]]
+		
+		#Find a random set of $nCpG indices $iterations times
+		if(ncores == 1){
+			if(!is.null(seed)) set.seed(seed)
+			permuted_cor <- lapply(dmr_length$CpGs, function(CpG){
+				eff_nrow <- nrow(chr_data)-as.numeric(CpG)
+				indices <- sample(x = 1:eff_nrow, size = iterations, replace = T)
+
+				nulldist <- t(sapply(X = indices, simplify = T, FUN = function(index){
+				       colMeans(getMeth(chr_data[index:(index+CpG-1), overlapping_samples], type = "raw"), na.rm = T)
+				}))
+				return(nulldist)
+	    		})
+		} else{
+			cl <- makeCluster(spec = ncores, type = cl_type)
+			if(!is.null(seed)) clusterSetRNGStream(cl = cl, iseed = seed)
+			clusterExport(cl, c("chr_data", "iterations", "overlapping_samples"), envir = environment())
+			clusterEvalQ(cl, library(bsseq))
+
+			permuted_cor <- parLapply(cl = cl, X = dmr_length$CpGs, fun = function(CpG){
+				eff_nrow <- nrow(chr_data)-as.numeric(CpG)
+				indices <- sample(x = 1:eff_nrow, size = iterations, replace = T)
+
+				nulldist <- t(sapply(X = indices, simplify = T, FUN = function(index){
+				       colMeans(getMeth(chr_data[index:(index+CpG-1), overlapping_samples], type = "raw"), na.rm = T)
+				}))
+				return(nulldist)
+	    		})
+			stopCluster(cl)
+			gc()
+
+		}
+		names(permuted_cor) <- paste0(dmr_length$chr, "_", dmr_length$CpGs)
+		return(permuted_cor)
+	})
+	permuted_cor <- unlist(permuted_cor, recursive = F)
+	permuted_cor_chr <- gsub("(.+)_.+", "\\1", names(permuted_cor))
+	permuted_cor_nCpGs <- gsub(".+_(.+)", "\\1", names(permuted_cor))
+
+	## Calculate probabilities
+	cat("Calculating the probabilities under the null (aka \"pvalues\")\n")
+	if(ncores == 1){
+
+		pvals <- lapply(correlations_gr, function(cor_entry){
+
+			perm_dmrs <- unlist(permuted_cor[[which(permuted_cor_chr == seqnames(cor_entry) & permuted_cor_nCpGs == cor_entry$nCpGs)]][, overlapping_samples])
+			transcription <- unlist(expr_data[unlist(mcols(cor_entry)[id_col_name]), overlapping_samples])
+
+			null_rhodist <- apply(X = perm_dmrs, MARGIN = 1, FUN = function(perm_dmr){
+				cor(perm_dmr, transcription, method = cor_type)
+			})
+
+			if(alternative == "two.tailed"){
+				pval <- mean(abs(cor_entry$rho) > abs(null_rhodist), na.rm = T)
+			} else if(alternative == "greater"){
+				pval <- mean(cor_entry$rho > null_rhodist, na.rm = T)
+			} else if(alternative == "less"){
+				pval <- mean(cor_entry$rho < null_rhodist, na.rm = T)
+			}
+		       return(pval)	
+		})
+	} else{
+		cl <- makeCluster(spec = ncores, type = cl_type)
+		if(!is.null(seed)) clusterSetRNGStream(cl = cl, iseed = seed)
+		clusterExport(cl, c("permuted_cor", "permuted_cor_chr", "permuted_cor_nCpGs", "overlapping_samples", "expr_data", "id_col_name"), envir = environment())
+
+		pvals <- parLapply(cl = cl, X = correlations_gr, fun = function(cor_entry){
+
+			perm_dmrs <- unlist(permuted_cor[[which(permuted_cor_chr == seqnames(cor_entry) & permuted_cor_nCpGs == cor_entry$nCpGs)]][, overlapping_samples])
+			transcription <- unlist(expr_data[unlist(mcols(cor_entry)[id_col_name]), overlapping_samples])
+
+			null_rhodist <- apply(X = perm_dmrs, MARGIN = 1, FUN = function(perm_dmr){
+				cor(perm_dmr, transcription, method = cor_type)
+			})
+
+			if(alternative == "two.tailed"){
+				pval <- mean(abs(cor_entry$rho) < abs(null_rhodist), na.rm = T)
+			} else if(alternative == "greater"){
+				pval <- mean(cor_entry$rho < null_rhodist, na.rm = T)
+			} else if(alternative == "less"){
+				pval <- mean(cor_entry$rho > null_rhodist, na.rm = T)
+			}
+			return(pval)	
+		})
+	}
+	stopCluster(cl)
+	gc()
+	correlations_gr$pvals <- unlist(pvals)
+
+	correlations_gr <- correlations_gr[with(correlations_gr, order(pvals, rev(abs(rho)), decreasing = F)), ]
+	
+	return(correlations_gr)
+}
+
+admrs_corr <- correlator_core(dmr_data = admr_mean_gr, expr_data = expr_data, meth_data = fit2, dmr_gene_anno = admrs_culled, id_col_name = "ENS", iterations = 1000, cor_type = "spearman", ncores = 2, seed = 124718)
+
+admrs_corr <- pval_permuter(correlations_gr = admrs_corr, meth_data = fit2, expr_data = expr_data, iterations = 1000, id_col_name = "ENS", cor_type = "spearman", ncores = 2, alternative = "two.tailed", seed = 124718)
+admrs_corr$padj <- p.adjust(admrs_corr$pvals)
+
+write.csv(data.frame(admrs_corr), "aDMRs.csv")
+#eQTMs are defined as correlations whose p-value < 0.05
+eqtms <- admrs_corr[admrs_corr$pvals < 0.05,]
+write.csv(data.frame(eqtms), "eQTMs.csv")
+
+```
+
+## DE_aDMRs & DeQTMs
+The correlation for each DMR and the log transformed transcription was calculated., however a strong correlation does not mean that the gene is differentially expressed. By filtering the aDMRs for the DEGs defined previously, we recouple the phenotype of interest (RA-severity) to our correlation. It is important to note that this approach does not take the probabilistic nature of DE into account. Unfortunately I know of no other way at the moment.
+```{r DaDMRs & DeQTMs}
+de_admrs <- admrs_corr[admrs_corr$ENS %in% unique_deg_symbols, ]
+write.csv(data.frame(de_admrs), "DE_aDMRs.csv")
+
+deqtms <- eqtms[eqtms$ENS %in% unique_deg_symbols,]
+write.csv(data.frame(deqtms), "DeQTMs.csv")
+```
+
+## Summary plots
+Volcano plot depicting the correlation coefficient versus the -log10(p-value). We expect to see a "V" shape as the absolute correlation coefficient is inversely correlated with the p-value.
+
+To find the overlap between the DMRs and the DEGs, we will have to simply find which annotated DMRs are located within genes that were found to be differentially expressed.
+
+```{r Overlap DMRs and DEGs}
+#Vennerable
+require(Vennerable)
+
+venn_list <- list(aDMRs = unique(admrs_gr$ENS),
+		  DEGs = unique_deg_symbols,
+		  eQTMs = unique(eqtms$ENS))
+
+venn_obj <- Venn(venn_list)
+
+#png("Gene_overlap.png", width = 2000, height = 1600, res = 150)
+pdf("Gene_overlap.pdf", width = 14, height = 14)
+plot(venn_obj, doEuler = T, doWeight = T)
+dev.off()
+
+#UpSetR
+require(UpSetR)
+all_genes <- unique(c(admrs_gr$ENS, unique_deg_symbols, de_admrs$ENS, deqtms$ENS))
+upset_df <- data.frame(Genes = all_genes,
+		       aDMRs = (all_genes %in% admrs_gr$ENS)*1,
+		       DEGs = (all_genes %in% unique_deg_symbols)*1,
+		       DaDMRs = (all_genes %in% de_admrs$ENS)*1,
+		       DeQTMs = (all_genes %in% deqtms$ENS)*1)
+rownames(upset_df) <- all_genes
+
+#png("Gene_overlap.png", width = 2000, height = 1600, res = 150)
+pdf("Gene_overlap.pdf", width = 2000, height = 1600, bg = "white")
+upset(upset_df, sets = c("aDMRs", "DEGs", "DaDMRs", "DeQTMs"))
+dev.off()
+```
+
+```{r Distribution aDMR correlation coefficient versus p value}
+require(ggExtra)
+require(ggplot2)
+cor_sig_plotter <- function(eqtm_gr, alpha = 0.05){
+	reg_df <- with(eqtm_gr, data.frame(rho = rho,
+					    log10p = -log10(pvals),
+					    feature = REG,
+					    significant = pvals < alpha)
+	)
+						
+	plot_obj <- ggplot(reg_df, aes(x = rho, y = log10p)) +
+			geom_point(aes(col = significant)) +
+		        scale_color_manual(values = c("#b3b3b3", "#4d4d4d")) +	
+			ylab("-log10(p)") +
+			geom_hline(yintercept = -log10(alpha)) +
+			theme_bw() +
+			xlim(-1, 1) +
+		        facet_grid(. ~ feature) +
+	       		theme(panel.grid.major = element_blank(),
+			      panel.grid.minor = element_blank())	       
+	return(plot_obj)	
+}
+
+#png(file = "cor_v_sig.png", width = 1000, height = 500, res = 150)
+pdf(file = "cor_v_sig.pdf", width = 8, height = 4)
+print(cor_sig_plotter(admrs_corr))
+dev.off()
+
+cor_dist_plotter <- function(eqtm_gr, alpha = 0.05){
+	reg_df <- with(eqtm_gr, data.frame(rho = rho,
+					   feature = REG,
+					   significant = pvals < alpha))
+
+	plot_obj <- ggplot(reg_df, aes(x = rho, fill = significant, cut = significant)) +
+	#	geom_histogram(aes(y = ..density..)) +
+		geom_density(alpha = 0.25) +
+		xlim(-1, 1) + 
+		facet_grid(. ~ feature) +
+		theme_bw() +
+		theme(panel.grid.major = element_blank(),
+		      panel.grid.minor = element_blank())
+	return(plot_obj)
+}
+
+
+#png(file = "cor_dist.png", width = 1000, height = 500, res = 150)
+pdf(file = "cor_dist.pdf", width = 8, height = 4)
+print(cor_dist_plotter(admrs_corr))
+dev.off()
+
+admr_plot_df <- with(admrs_corr, data.frame(rho = rho,
+					    feature = REG,
+					    Source = "Observed"))
+#Normal distribution Enhancers
+admrs_norm_enh <- admr_plot_df[admr_plot_df$feature == "Enhancer", ]
+admrs_rnorm_enh_norm <- rnorm(n = nrow(admrs_norm_enh), 
+			      mean = admrs_norm_enh, 
+			      sd = sd(admrs_norm_enh$rho)/(max(admrs_norm_enh$rho)-min(admrs_norm_enh$rho))
+admrs_rnorm_enh_norm <- data.frame(rho = admrs_rnorm_enh_norm, feature = "Enhancer", Source = "Sampled")
+
+#Normal distribution Promoters
+admrs_norm_prom <- admr_plot_df[admr_plot_df$feature == "Promoter", ]
+admrs_rnorm_prom_norm <- rnorm(n = nrow(admrs_norm_prom),
+			       mean = mean(admrs_norm_prom$rho,
+			       sd = sd(admrs_norm_prom$rho)/(max(admrs_norm_prom$rho)-min(admrs_norm_prom$rho))
+admrs_rnorm_prom_norm <- data.frame(rho = admrs_rnorm_prom_norm, feature = "Promoter", Source = "Sampled")
+
+admr_plot_df_dist <- rbind(admr_plot_df, admrs_rnorm_enh_norm, admrs_rnorm_prom_norm)
+
+#png(file = "cor_dist_non_stratified.png", width = 1000, height = 500, res = 150)
+pdf(file = "cor_dist_non_stratified.pdf", width = 8, height = 4)
+admr_plot <- ggplot(admr_plot_df_dist, aes(x = rho, group = Source, fill = Source, col = Source)) + 
+		   xlim(-1, 1) +
+		   geom_histogram(alpha = 0.5, position = "identity", aes(y = ..density..)) + 
+		   geom_density(alpha = 0.2) +
+		   facet_grid(. ~ feature) +
+		   theme_bw() +
+		   theme(panel.grid.major = element_blank(),
+			 panel.grid.minor = element_blank())
+print(admr_plot)	   
+dev.off()
+```
+
+##Enrichment analyses
+We seek to perform overrepresentation and TFBS analyses of the DMR sequences.
+```{r subsetting for enrichment analyses}
+
+require(Rsamtools)
+admrs_bed <- admrs_corr
+
+admrs_bed <- data.frame(seqnames = paste0("chr", seqnames(admrs_corr)),
+			starts = start(admrs_corr) - 1,
+			ends = end(admrs_corr),
+			dmr_id = 1:length(admrs_corr),
+			Unused = NA,
+			strand = ".")
+write.table(admrs_bed, file = "admrs.bed", quote = F, sep = "\t", row.names = F, col.names = F)
+			
+
+prom_neg <- eqtms[with(eqtms, rho < 0 & REG == "Promoter"), ]
+prom_pos <- sig_eqtms[with(sig_eqtms, rho >= 0 & REG == "Promoter"), ]
+enh_neg <- sig_eqtms[with(sig_eqtms, rho < 0 & REG == "Enhancer"), ]
+enh_pos <- sig_eqtms[with(sig_eqtms, rho >= 0 & REG == "Enhancer"), ]
+fish_df <- matrix(c(length(prom_neg), length(prom_pos), length(enh_neg), length(enh_pos)), byrow = T, nrow = 2, dimnames = list(Regulator = c("Prom", "Enh"), Correlation = c("Neg", "Pos")))
+
+#The pose the question whether the number of negatively correlated promoter eQTMs are significantly larger than the negatively correlated enhancer eQTMs. 
+fisher.test(fish_df, alternative = "greater") 
+
+eqtm_enhancers <- eqtms[which(eqtms$REG == "Enhancer"), ]
+eqtm_promoters <- eqtms[which(eqtms$REG == "Promoter"), ]
+
+
+hypo_neg_dmen <- neg_dmen[which(neg_dmen$dmrdirection == "hypo"), ]
+hyper_neg_dmen <- neg_dmen[which(neg_dmen$dmrdirection == "hyper"), ]
+
+pos_dmen <- dmen_corr_df[which(dmen_corr_df$pval < 0.05 & dmen_corr_df$rho > 0), ]
+hypo_pos_dmen <- pos_dmen[which(pos_dmen$dmrdirection == "hypo"), ]
+hyper_pos_dmen <- pos_dmen[which(pos_dmen$dmrdirection == "hyper"), ]
+
+neg_dmprom <- dmprom_corr_df[which(dmprom_corr_df$pval < 0.05 & dmprom_corr_df$rho < 0), ]
+hypo_neg_dmprom <- neg_dmprom[which(neg_dmprom$dmrdirection == "hypo"), ]
+hyper_neg_dmprom <- neg_dmprom[which(neg_dmprom$dmrdirection == "hyper"), ]
+
+pos_dmprom <- dmprom_corr_df[which(dmprom_corr_df$pval < 0.05 & dmprom_corr_df$rho > 0), ]
+hypo_pos_dmprom <- pos_dmprom[which(pos_dmprom$dmrdirection == "hypo"), ]
+hyper_pos_dmprom <- pos_dmprom[which(pos_dmprom$dmrdirection == "hyper"), ]
+
+write.csv(hypo_neg_dmen, "hypo_neg_dmen.csv")
+write.csv(hyper_neg_dmen, "hyper_neg_dmen.csv")
+write.csv(hypo_pos_dmen, "hypo_pos_dmen.csv")
+write.csv(hyper_pos_dmen, "hyper_pos_dmen.csv")
+
+write.csv(hypo_neg_dmprom, "hypo_neg_dmprom.csv")
+write.csv(hyper_neg_dmprom, "hyper_neg_dmprom.csv")
+write.csv(hypo_pos_dmprom, "hypo_pos_dmprom.csv")
+write.csv(hyper_pos_dmprom, "hyper_pos_dmprom.csv")
+
+```
+
+## Visualization of the eQTM
+```{r eQTM visualization}
+eqtm_plot <- function(dmr_data, expr_data, chr, start, end, ensembl_id, degrees, plot_title, legend_title = NULL){
+	#dmr_data: A dataframe containing the methylation data with individual methylation features as rows and samples as columns.
+	#expr_data: A dataframe containing the expression data with individual expression features as rows and samples as columns.
+	#degrees: A vector containing the degrees used to color the points with. Names must be the same as the ones used for the methylation and expression data.
+
+	ensembl_id <- as.character(ensembl_id)
+	overlapping_samples <- intersect(colnames(expr_data), colnames(mcols(dmr_data)) )
+
+	degrees <- degrees[overlapping_samples]
+	dmr_data <- unlist(as.data.frame(mcols(dmr_data[which(seqnames(dmr_data) == chr & start(dmr_data) == start & end(dmr_data) == end), overlapping_samples])))
+	expr_data <- unlist(expr_data[ensembl_id, overlapping_samples])
+
+	plot_df <- data.frame(methylation = dmr_data, transcription = expr_data, groups = degrees) 
+
+	require(ggplot2)
+	p <- ggplot(plot_df, aes(x = methylation, y = transcription)) + 
+		geom_point(aes(fill = groups), color = "black", shape = 21, size = 4) + 
+		theme_bw() +
+		xlab("Methylation") + 
+		ylab("Expression") + 
+		xlim(0,1) +
+		ggtitle(plot_title) + 
+		theme(plot.title = element_text(face = "bold"),
+			axis.title = element_text(size = 14, face = "bold"),
+			axis.text = element_text(size = 12), 
+			legend.title = element_text(size = 14, face = "bold"),
+			legend.text = element_text(size = 12),
+			legend.position = "bottom")
+	if(is.numeric(plot_df$groups) & !is.null(legend_title)){
+		p <- p + scale_fill_continuous(name = legend_title)
+	} else{
+		p <- p + scale_fill_discrete(name = legend_title)
+	}
+	return(p)
+}
+
+named_swelling <- pData(fit2)$Swelling
+names(named_swelling) <- pData(fit2)$Sample
+named_sjc <- pData(fit2)$SJC
+names(named_sjc) <- pData(fit2)$Sample
+
+png("tophit.png", height = 800, width = 800, res = 150)
+eqtm_plot(dmr_data = admr_mean_gr, expr_data = expr_data, chr = as.character(seqnames(eqtms[5,])), start = start(eqtms[5,]), end = end(eqtms[5,]), degrees = named_swelling, ensembl_id = as.character(eqtms[5, ]$ENS), plot_title = as.character(eqtms[5,]$SYMBOL))
+dev.off()
+
+#Correlation plot wrapper
+eqtm_plot_wrapper <- function(i, eqtms){
+  pdf(paste0(i, "_", eqtms$SYMBOL[i], "_correlation.pdf"), height = 4, width = 4)
+  print(eqtm_plot(dmr_data = admr_mean_gr, expr_data = expr_data, chr = as.character(seqnames(eqtms))[i], start = start(eqtms)[i], end = end(eqtms)[i], degrees = named_swelling, ensembl_id = eqtms$ENS[i], plot_title = eqtms$SYMBOL[i]))
+  dev.off()
+}
+
+```
+
+Next we would want to generate a graphic that can accurately model the regulators
+```{r Interaction plots}
+require(GenomicInteractions)
+require(GenomicFeatures)
+require(Gviz)
+
+promoter_dir <- "../Data/EnsemblRegulatoryBuild/v89/"
+promoters_gr <- makeGRangesFromDataFrame(df = read.csv(paste0(promoter_dir, "GRCh38_promoters_blood.csv"))[,-1], keep.extra.columns = T)
+
+enhancer_dir <- "../Data/Javierre2016/"
+enhancers_df <- read.csv(paste0(enhancer_dir, "ActiveProm_anno_GRCh38.csv"))[,-1]
+enhancers_bait <- makeGRangesFromDataFrame(df = enhancers_df, keep.extra.columns = T, seqnames.field = "baitChr", start.field = "baitStart", end.field = "baitEnd")
+#seqlevelsStyle(enhancers_bait) <- "UCSC"
+enhancers_oe <- makeGRangesFromDataFrame(df = enhancers_df, seqnames.field = "oeChr", start.field = "oeStart", end.field = "oeEnd")
+#seqlevelsStyle(enhancers_oe) <- "UCSC"
+enhancers_interact <- GenomicInteractions(enhancers_bait, enhancers_oe)
+
+meth <- readRDS("../../0_Original_project/data/analysis/WGBS/07differentialMethylation/meth.rds")
+seqlevelsStyle(meth) <- "NCBI"
+
+txdb_dir <- "~/data/ensembl_annotation/"
+grch38_txdb <- keepStandardChromosomes(loadDb(paste0(txdb_dir, "Homo_sapiens.GRCh38.89.txdb.db")))
+grch38_gr <- genes(grch38_txdb)
+require(biomaRt)
+#ENS89 <- useEnsembl(biomart = "ensembl", dataset = "hsapiens_gene_ensembl", version = 89)
+ENS90 <- useEnsembl(biomart = "ensembl", dataset = "hsapiens_gene_ensembl", version = 90)
+
+#ENS2Symbol <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"), filters = "ensembl_gene_id", values = names(grch38_gr), mart = ENS89)
+ENS2Symbol <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"), filters = "ensembl_gene_id", values = names(grch38_gr), mart = ENS90)
+
+ENS2Symbol <- aggregate(hgnc_symbol~., ENS2Symbol, FUN = toString)
+ENS2Symbol$hgnc_symbol <- gsub(", ", ";", ENS2Symbol$hgnc_symbol)
+rownames(ENS2Symbol) <- ENS2Symbol$ensembl_gene_id
+grch38_gr$SYMBOL <- ENS2Symbol[grch38_gr$gene_id, ]$hgnc_symbol
+
+#Gviz
+aDMR_loc_core <- function(chr, start_region, end_region, measure = NULL, flanks = 1000, enh_int, prom_gr, gene_name, factor_interest, bm, build = "hg38", col_interaction = "red"){
+
+	options(ucscChromosomeNames = F)
+  if(build == "hg38") {gbuild <- "grch38"}
+
+	#Plotting region
+	eff_start <- start_region-flanks
+	eff_end <- end_region+flanks
+
+	gtrack <- GenomeAxisTrack()
+	#itrack <- IdeogramTrack(genome = build, chromosome = chr)
+	grtrack <- BiomartGeneRegionTrack(biomart = bm, genome = gbuild, chromosome = chr, start = eff_start, end = eff_end, name = "ENS", collapseTranscripts = "meta", transcriptAnnotation = "symbol")
+	enhtrack <- InteractionTrack(enh_int, chromosome = chr, name = "Enh")
+	displayPars(enhtrack) = list(anchor.height = 0.1,
+				     col.interactions = col_interaction)
+	if(!is.null(measure)){
+		displayPars(enhtrack) = list(interaction.dimension = "height",
+					     interaction.measure = measure)
+	}
+
+	promtrack <- AnnotationTrack(reduce(prom_gr), chromosome = chr, start = eff_start, end = eff_end, name = "Prom", collapse = T)
+	methtrack <- AnnotationTrack(reduce(admrs_gr), chromosome = chr, start = eff_start, end = eff_end, name = "DMR", collapse = T)
+	
+	tracklist <- list(gtrack, grtrack, enhtrack, promtrack, methtrack) 
+	
+	plotTracks(trackList = tracklist, from = eff_start, to = eff_end, name = name, cex.title = 0.75, cex.axis = 0.75, cex.legend = 0.75, fontcolor = "black")
+}
+
+aDMR_plot_core <- function(admrs_gr, meth_gr, factor_interest){
+	start_reg <- start(admrs_gr)
+	end_reg <- end(admrs_gr)
+	width_reg <- width(admrs_gr)
+	
+	flanks <- ifelse(width_reg < 500, 500, width_reg) 
+
+	gtrack <- GenomeAxisTrack()
+
+	meth_gr_sub <- subsetByOverlaps(meth_gr, admrs_gr+flanks)
+
+	methtrack <- DataTrack(meth_gr_sub, groups = factor_interest, ylim = c(0,1), type = c("a", "confint"), legend = T, col = gg_color_hue(length(levels(factor_interest))))
+	hltrack <- HighlightTrack(methtrack, chromosome = as.character(seqnames(admrs_gr)), start = start_reg, end = end_reg, fill = NA)
+
+	plotTracks(trackList = list(gtrack, hltrack), cex.title = 1, cex.axis = 1, cex.legend = 1, fontcolor = "black")
+}
+
+aDMR_viz <- function(admrs_gr, n, factor_interest){
+	#Find the plotting range to show the DMR, the gene and the regulatory region
+	##Gene
+	ens_id <- as.character(admrs_gr[n,]$ENS)
+	gene_coords <- genes(grch38_txdb)[ens_id,]
+	##Regulatory region
+	if(admrs_gr[n,]$REG == "Enhancer"){
+		reg_coords <- anchorOne(enhancers_interact)[subjectHits(findOverlaps(admrs_gr[n,], anchorTwo(enhancers_interact))),]
+	} else{
+		reg_coords <- promoters_gr[subjectHits(findOverlaps(admrs_gr[n,], promoters_gr)),]
+	}
+
+	plotreg <- c(range(admrs_gr[n,]), range(gene_coords), range(reg_coords))
+
+	#I know there is a function that flattens the GRanges object, I just cannot come up with it at the moment
+	plotreg_range <- range(plotreg, ignore.strand = T)
+	plotreg_flanks <- round(width(plotreg_range)/5)
+
+	#Filter enhancers_interact for the genes of interest
+	enhancers_goi <- enhancers_interact[which(mcols(enhancers_interact)$anchor1.baitENS == ens_id),]
+
+	pdf(paste0(n, "_", admrs_gr[n, ]$SYMBOL, "_location.pdf"), width = 8, height = 4)
+	aDMR_loc_core(chr = as.character(seqnames(admrs_gr[n,])), 
+	              start_region = start(plotreg_range), 
+	              end_region = end(plotreg_range), 
+	              flanks = plotreg_flanks, 
+	              enh_int = enhancers_goi, 
+	              prom_gr = promoters_gr, 
+	              bm = ENS90, 
+	              gene_name = admrs_gr[n,]$SYMBOL, 
+	              factor_interest = factor_interest) 
+	dev.off()
+
+	pdf(paste0(n, "_", admrs_gr[n, ]$SYMBOL, "_methylation.pdf"), width = 4, height = 4)
+	aDMR_plot_core(admrs_gr = admrs_gr[n,], meth_gr = meth, factor_interest = factor_interest)
+	dev.off()
+}
+
+aDMR_viz(de_admrs, 13, factor_interest = pData(fit2)$Swelling)
+eqtm_plot_wrapper(13, de_admrs)
+```
+
+```{r correlation plots}
+#DaDMRs
+dir.create("DE_aDMRs")
+setwd("DE_aDMRs")
+for(i in 1:length(de_admrs)){
+	eqtm_plot_wrapper(i, de_admrs)
+	aDMR_viz(de_admrs, n, factor_interest = pData(fit2)$Swelling)
+}
+setwd("..")
+
+pdf("SP110.pdf", height = 4, width = 4)
+eqtm_plot(dmr_data = admr_mean_gr, expr_data = expr_data, chr = as.character(seqnames(de_admrs[13,])), start = start(de_admrs[13,]), end = end(de_admrs[13,]), degrees = named_swelling, ensembl_id = "ENSG00000135899", plot_title = "SP110")
+dev.off()
+
+#eQTMs
+dir.create("eQTMs")
+setwd("eQTMs")
+for(i in 1:length(eqtms)){
+	eqtm_plot_wrapper(i, eqtms)
+	aDMR_viz(eqtms, i, factor_interest = pData(fit2)$Swelling)
+}
+setwd("..")
+
+#DeQTMs
+dir.create("DeQTMs")
+setwd("DeQTMs")
+for(i in 1:length(deqtms)){
+	eqtm_plot_wrapper(i, deqtms)
+	aDMR_viz(deqtms, i, factor_interest = pData(fit2)$Swelling)
+}
+setwd("..")
+
+
+#eQTM_SNPs (See 1_2)
+eqtm_plot_wrapper(which(admrs_culled$SYMBOL == "UBE2Q1"), admrs_culled)
+eqtm_plot_wrapper(which(admrs_culled$SYMBOL == "IL6R"), admrs_culled)
+eqtm_plot_wrapper(which(admrs_culled$SYMBOL == "KATNA1"), admrs_culled)
+
+#DAPP1
+eqtm_plot_wrapper(8, admrs_corr) 
+eqtm_plot_wrapper(49, admrs_corr)
+
+#SP140
+aDMR_viz(de_admrs, 13, factor_interest = pData(fit2)$Swelling)
+
+```
+
+```{r Positive promoter methylation eQTM}
+posprom_eqtms <- eqtms[which(eqtms$REG == "Promoter" & eqtms$rho > 0),]
+
+for(i in 1:length(posprom_eqtms)){
+	aDMR_viz(posprom_eqtms, i, factor_interest = pData(fit2)$Swelling)
+	eqtm_plot_wrapper(i, posprom_eqtms)
+}
+
+```
+
+# Specific questions to be answered
+Now that we have the correlation coefficients for each aDMR, the DE_aDMRs, the eQTMs, and DeQTMs, we can pose a few questions of interest regarding the promoters and enhancers:
+1. Which genes are affected by DMRs in several regulatory regions?
+   	Which genes are affected by DMRs in both promoters and enhancers? 
+2. Which aDMRs affect multiple genes?
+   	Are these genes co-expressed? 
+
+## Question 1: Which genes are regulated by several regulatory regions?
+To answer this question, the fast way is to simply tabulate the number of gene symbol occurrences in the list
+```{r Gene symbol summary}
+sort(table(admrs_corr$SYMBOL))
+table(table(admrs_corr$SYMBOL))
+```
+
+```{r Promiscuous genes}
+prom_symbols <- names(which(table(admrs_corr$SYMBOL) > 1))
+prom_genes <- admrs_corr[admrs_corr$SYMBOL %in% prom_symbols, ]
+prom_genes <- prom_genes[order(prom_genes$SYMBOL), ]
+
+
+prom_genes_list <- split(prom_genes, prom_genes$SYMBOL)
+prom_genes_list <- prom_genes_list[which(sapply(prom_genes_list, function(prom_gene){
+	length(unique(prom_gene$REG)) > 1
+}))]
+write.csv(as.data.frame(prom_genes_list), "prom_genes_aDMRs.csv")
+
+prom_gene_viz <- function(prom_dmr_gr, factor_interest){
+	#Find the plotting range to show the DMR, the gene and the regulatory region
+
+	##Gene
+	ens_id <- as.character(unique(prom_dmr_gr$ENS))
+	gene_symbol <- as.character(unique(prom_dmr_gr$SYMBOL))
+	if(length(ens_id) != 1) stop("Several Ensembl IDs found")
+
+	gene_coords <- range(genes(grch38_txdb)[ens_id,])
+	dmr_coords <- range(prom_dmr_gr)
+	#enh_coords <- range(anchorTwo(enhancers_interact)[which(mcols(enhancers_interact)$anchor1.baitENS == ens_id),])
+	#prom_coords <- range(promoters_gr[promoters_gr$geneId == ens_id,])
+
+	#plotreg <- range(c(gene_coords, enh_coords, prom_coords), ignore.strand = T)
+	plotreg <- range(c(gene_coords, dmr_coords), ignore.strand = T)
+
+	#I know there is a function that flattens the GRanges object, I just cannot come up with it at the moment
+	plotreg_flanks <- round(width(plotreg)/5)
+
+	#Filter enhancers_interact for the genes of interest
+	enhancers_goi <- enhancers_interact[which(mcols(enhancers_interact)$anchor1.baitENS == ens_id),]
+
+	pdf(paste0(gene_symbol, "_location.pdf"), width = 8, height = 4)
+	aDMR_loc_core(chr = as.character(seqnames(plotreg)), start_region = start(plotreg), end_region = end(plotreg), flanks = plotreg_flanks, enh_int = enhancers_goi, prom_gr = promoters_gr, genes_txdb = grch38_txdb, gene_name = prom_dmr_gr[n,]$SYMBOL, factor_interest = factor_interest) 
+	dev.off()
+
+	for(i in 1:length(prom_dmr_gr)){
+		dmr_coordinates <- paste0(as.character(seqnames(prom_dmr_gr[i,])), "_", start(prom_dmr_gr[i,]), "_", end(prom_dmr_gr[i,]))
+		pdf(paste0(gene_symbol, "-", dmr_coordinates, ".pdf"), width = 4, height = 4)
+		aDMR_plot_core(admrs_gr = prom_dmr_gr[i,], meth_gr = meth, factor_interest = factor_interest)
+		dev.off()
+
+		eqtm_plot_wrapper(i, prom_dmr_gr)
+	}
+}
+
+prom_gene_viz(prom_genes_list$DAPP1, factor_interest = pData(fit2)$Swelling)
+
+prom_genes_list_noX <- prom_genes_list[names(which(lapply(prom_genes_list, function(x){unique(as.character(seqnames(x)))}) != "X"))]
+
+lapply(prom_genes_list_noX, prom_gene_viz, factor_interest = pData(fit2)$Swelling)
+```
+
+## Question 2: Which regulatory regions contain DMRs and affect multiple genes?
+To answer the question which differentially methylated regulatory regions affect multiple genes, we can utilize the same strategy as the one implemented in question 1, namely sorting and splitting for the regulatory coordinates. 
+```{r DMR summary}
+table(paste0(seqnames(eqtms), start(eqtms), end(eqtms)))
+table(table(paste0(seqnames(eqtms), start(eqtms), end(eqtms))))
+```
+
+As some DMRs overlap with one another due to them being called through different contrast, the first step is to perform a reduce() and then group all the DMRs that overlap the same area.
+```{r Promiscuous DMRs}
+admrs_coords <- paste0(seqnames(admrs_corr), ":", start(admrs_corr), "_", end(admrs_corr))
+true_prom_dmrs <- split(admrs_corr, admrs_coords)
+num_prom_dmrs <- lapply(true_prom_dmrs, function(entry){
+	length(entry)
+})
+prom_dmrs <- true_prom_dmrs[which(num_prom_dmrs > 1)]
+
+write.csv(data.frame(prom_dmrs), "prom_dmrs.csv") 
+
+#Visualization of the promiscuous DMRs
+prom_dmr_viz <- function(prom_dmr_gr, factor_interest){
+	#Find the plotting range to show the DMR, the gene and the regulatory region
+	prom_dmr_unique <- unique(prom_dmr_gr)
+
+	##Gene
+	ens_ids <- as.character(unique(prom_dmr_gr$ENS))
+
+	gene_coords <- range(genes(grch38_txdb)[ens_ids,])
+	dmr_coords <- range(prom_dmr_gr)
+	enh_coords <- range(anchorOne(enhancers_interact)[queryHits(findOverlaps(anchorTwo(enhancers_interact), dmr_coords)),])
+	#prom_coords <- range(promoters_gr[promoters_gr$geneId == ens_id,])
+
+	#plotreg <- range(c(gene_coords, enh_coords, prom_coords), ignore.strand = T)
+	plotreg <- range(c(gene_coords, dmr_coords), ignore.strand = T)
+
+	#I know there is a function that flattens the GRanges object, I just cannot come up with it at the moment
+	plotreg_flanks <- round(width(plotreg)/5)
+
+	#Filter enhancers_interact for the genes of interest
+	enhancers_goi <- enhancers_interact[queryHits(findOverlaps(anchorTwo(enhancers_interact), dmr_coords)),]
+
+	pdf(paste0(seqnames(prom_dmr_unique), "_", start(prom_dmr_unique), "-", end(prom_dmr_unique), "_interactions.pdf"), width = 8, height = 4)
+	aDMR_loc_core(chr = as.character(seqnames(plotreg)), start_region = start(plotreg), end_region = end(plotreg), measure = abs(prom_dmr_gr$rho), flanks = plotreg_flanks, enh_int = enhancers_goi, prom_gr = promoters_gr, genes_txdb = grch38_txdb, gene_name = prom_dmr_gr[n,]$SYMBOL, factor_interest = factor_interest, col_interaction = "blue") 
+	dev.off()
+
+#	for(i in 1:length(prom_dmr_gr)){
+#		dmr_coordinates <- paste0(as.character(seqnames(prom_dmr_gr[i,])), "_", start(prom_dmr_gr[i,]), "_", end(prom_dmr_gr[i,]))
+#		pdf(paste0(gene_symbol, "-", dmr_coordinates, ".pdf"), width = 4, height = 4)
+#		aDMR_plot_core(admrs_gr = prom_dmr_gr[i,], meth_gr = meth, factor_interest = factor_interest)
+#		dev.off()
+#
+#		eqtm_plot_wrapper(i, prom_dmr_gr)
+#	}
+}
+
+prom_dmr_viz(prom_dmrs[[1]], pData(fit2)$Swelling)
+
+#Distribution of the promiscuous DMRs
+require(gtools)
+
+prom_dmrs_dist <- data.frame(table(gsub("(^.+):.+", "\\1", names(prom_dmrs))))
+colnames(prom_dmrs_dist) <- c("Chromosome", "Frequency")
+prom_dmrs_dist$Chromosome <- factor(prom_dmrs_dist$Chromosome, levels = mixedsort(as.character(prom_dmrs_dist$Chromosome)))
+
+dmr_dist_bar <- ggplot(prom_dmrs_dist, aes(Chromosome, Frequency)) + 
+	geom_bar(stat = "identity") + 
+	theme_bw() +
+	theme(panel.grid.major = element_blank(),
+	      panel.grid.minor = element_blank())
+
+pdf("promdmr_dist.pdf", width = 7, height = 4)
+print(dmr_dist_bar)
+dev.off()
+
+#Co-regulation promiscuous DMRs genes
+prom_dmr_gene_cor <- lapply(prom_dmrs, function(prom_dmr){
+	prom_dmr_exprs <- expr_data[as.character(prom_dmr$ENS), ]
+	rownames(prom_dmr_exprs) <- as.character(prom_dmr$SYMBOL)
+	prom_dmr_gene_cor <- cor(t(prom_dmr_exprs))
+	return(prom_dmr_gene_cor)
+})
+
+gene_coreg <- function(prom_dmr){
+	prom_dmr_cor <- prom_dmr_gene_cor[[prom_dmr]]
+	prom_dmr_cor <- round(prom_dmr_cor, 2)
+
+	reorder_cormat <- function(cormat){
+		dd <- as.dist((1-cormat)/2)
+		hc <- hclust(dd)
+		cormat <- cormat[hc$order, hc$order]
+		return(cormat)
+	}
+	prom_dmr_cor <- reorder_cormat(prom_dmr_cor)
+	prom_dmr_cor[lower.tri(prom_dmr_cor)] <- NA
+
+	plotname <- prom_dmr
+	plotname <- sub(":", "_", plotname)
+	
+	require(reshape2)
+	prom_dmr_upper_melt <- melt(prom_dmr_cor, na.rm = T)
+
+	require(ggplot2)
+	pdf(paste0(plotname, "_coregulation.pdf"), width = 4, height = 4)
+	plot_obj <- ggplot(data = prom_dmr_upper_melt, aes(Var2, Var1, fill = value)) +
+		geom_tile(color = "white") +
+		scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, limit = c(-1, 1), space = "Lab", name = "Pearson\nCorrelation") +
+		geom_text(aes(Var2, Var1, label = value), color = "black", size = 3) +
+		theme_minimal() +
+		theme(axis.text.x = element_text(angle = 45, vjust = 1, size = 12, hjust = 1),
+		      axis.title.x = element_blank(),
+		      axis.title.y = element_blank(),
+		      panel.grid.major = element_blank(),
+		      panel.border = element_blank(),
+		      panel.background = element_blank(),
+		      axis.ticks = element_blank(),
+		      legend.justification = c(1,0),
+		      legend.position = c(0.6, 0.7),
+		      legend.direction = "horizontal") +
+		guides(fill = guide_colorbar(barwidth = 7, barheight = 1, title.position = "top", title.hjust = 0.5)) +			   
+		coord_fixed()
+	print(plot_obj)
+	dev.off()
+}
+
+#Sort promiscuous DMRs by mean abs correlation
+prom_dmr_mean_rho <- prom_dmrs[names(sort(unlist(lapply(prom_dmrs, function(prom_dmr){max(abs(prom_dmr$rho))})), decreasing = T))]
+
+setwd("Coregulation")
+lapply(names(prom_dmr_gene_cor), function(prom_dmr){
+	gene_coreg(prom_dmr)
+	prom_dmr_viz(prom_dmrs[[prom_dmr]], pData(fit2)$Swelling)
+})
+setwd("..")
+
+gene_coreg("22:37425951_37426035")
+prom_dmr_viz(prom_dmrs[["22:37425951_37426035"]], pData(fit2)$Swelling)
+
+## Find coregulated genes (Pearson cor > 0.8)
+prom_dmr_strongcor <- lapply(prom_dmr_gene_cor, function(prom_dmr){
+	up_tri <- abs(prom_dmr[upper.tri(prom_dmr)]) > 0.8
+	ifelse(any(up_tri == T), T, F)
+})
+prom_dmr_strongcor_genecor <- prom_dmr_gene_cor[names(which(unlist(prom_dmr_strongcor)))]
+prom_dmr_strongcor_dmrdata <- prom_dmrs[names(which(unlist(prom_dmr_strongcor)))]
+
+## Are there any DEGs among the promiscuous DMRs
+prom_dmr_genes <- lapply(prom_dmrs, function(prom_dmr){as.character(prom_dmr$ENS)})
+prom_dmr_degs <- which(unlist(lapply(prom_dmr_genes, function(prom_dmr_gene){any(prom_dmr_gene %in% unique_deg_symbols)})))
+prom_dmr_degs_df <- prom_dmrs[names(prom_dmr_degs)]
+
+lapply(prom_dmr_degs_df, function(prom_dmr){prom_dmr$ENS %in% unique_deg_symbols})
+
+write.csv(data.frame(unlist(prom_dmrs[names(prom_dmr_degs)])), "prom_dmrs_degs.csv")
+
+```

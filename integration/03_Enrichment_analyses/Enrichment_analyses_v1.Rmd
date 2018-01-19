@@ -1,0 +1,118 @@
+---
+ title: "Enrichment analyses"
+ author: "Enrico Ferrero"
+ date: "June/July 2017"
+ output:
+   pdf_document:
+     highlight: tango
+     number_sections: yes
+     toc: yes
+---
+This workbook is based on the enrichment analyses which Enrico Ferrero performed on the DEGs for HvL and HvN (09enrichmentanalyses.R). The necessary parameters have been adjusted to allow for (DE) aDMRs and (DE) eQTMs to be analyzed.
+
+```{r Filepaths}
+data_dir <- file.path("../../data")
+output_dir <- file.path("../../output")
+
+primary_analyses_dir <- file.path(data_dir, "Primary_analyses")
+degs_dir <- file.path(file.path(data_dir, "data/analysis/WGBS/07differentialMethylation"))
+
+admrs_path <- file.path(output_dir, "02_eQTM_analyses/aDMRs")
+degs_summary_path <- file.path(output_dir, "02_eQTM_analyses/DEG_summary")
+
+enrichment_results_dir <- file.path(output_dir, "03_Enrichment_analyses")
+dir.create(enrichment_results_dir)
+```
+
+```{r Parameters}
+pval <- 0.05
+fc <- 1.5
+alpha <- 0.05
+top <- 60
+```
+
+```{r Ensembl to Entrez}
+ENS2Entrez_dir <- file.path(data_dir, "Ensembl/Conversion")
+if(!file.exists(file.path(ENS2Entrez_dir, "ENS2Entrez.csv"))){
+	require(biomaRt)
+	ENS <- useEnsembl(biomart = "ensembl", dataset = "hsapiens_gene_ensembl", version = 89)
+	ENS2Entrez <- getBM(mart = ENS, attributes = c("ensembl_gene_id", "entrezgene"))
+
+	dir.create(ENS2Entrez_dir)
+	write.csv(ENS2Entrez, file.path(ENS2Entrez_dir, "ENS2Entrez.csv"))
+} else{
+	ENS2Entrez <- read.csv(file.path(ENS2Entrez_dir, "ENS2Entrez.csv"), stringsAsFactors = F)[, -1]
+}
+```
+
+```{r Libraries} 
+library(metabaser)
+metabase.connect(dbname="USPRD106", uid="genego", pwd="muttl3y")
+```
+
+```{r Differential Analyses}
+aDMRs <- read.csv(file.path(admrs_path, "aDMRs.csv"))[,-1]
+DE_aDMRs <- read.csv(file.path(admrs_path, "DE_aDMRs.csv"))[,-1]
+eQTMs <- read.csv(file.path(admrs_path, "eQTMs.csv"))[,-1]
+DeQTMs <- read.csv(file.path(admrs_path, "DeQTMs.csv"))[,-1]
+DEGs <- read.csv(file.path(degs_summary_path, "DEG_Entrez.csv"))[,-1]
+
+aDMRs$Entrez <- ENS2Entrez[match(aDMRs$ENS, ENS2Entrez$ensembl_gene_id), ]$entrezgene
+DE_aDMRs$Entrez <- ENS2Entrez[match(DE_aDMRs$ENS, ENS2Entrez$ensembl_gene_id), ]$entrezgene
+eQTMs$Entrez <- ENS2Entrez[match(eQTMs$ENS, ENS2Entrez$ensembl_gene_id), ]$entrezgene
+DeQTMs$Entrez <- ENS2Entrez[match(DeQTMs$ENS, ENS2Entrez$ensembl_gene_id), ]$entrezgene
+```
+
+```{r Ontology Analyses}
+maps <- load.ontology("maps")
+gobp <- load.ontology("go_bp")
+
+aDMRs_maps <- enrichment(aDMRs$Entrez, ontology = maps)
+aDMRs_gobp <- enrichment(aDMRs$Entrez, ontology = gobp)
+
+DE_aDMRs_maps <- enrichment(DE_aDMRs$Entrez, ontology = maps)
+DE_aDMRs_gobp <- enrichment(DE_aDMRs$Entrez, ontology = gobp)
+
+eQTMs_maps <- enrichment(eQTMs$Entrez, ontology = maps)
+eQTMs_gobp <- enrichment(eQTMs$Entrez, ontology = gobp)
+
+DeQTMs_maps <- enrichment(DeQTMs$Entrez, ontology = maps)
+DeQTMs_gobp <- enrichment(DeQTMs$Entrez, ontology = gobp)
+
+DEGs_maps <- enrichment(DEGs, ontology = maps)
+DEGs_gobp <- enrichment(DEGs, ontology = gobp)
+
+write.enrichment(aDMRs_maps, file = file.path(enrichment_results_dir, "aDMRs_maps.txt"))
+write.enrichment(aDMRs_gobp, file = file.path(enrichment_results_dir, "aDMRs_gobp.txt"))
+
+write.enrichment(DE_aDMRs_maps, file = file.path(enrichment_results_dir, "DE_aDMRs_maps.txt"))
+write.enrichment(DE_aDMRs_gobp, file = file.path(enrichment_results_dir, "DE_aDMRs_gobp.txt"))
+
+write.enrichment(eQTMs_maps, file = file.path(enrichment_results_dir, "eQTMs_maps.txt"))
+write.enrichment(eQTMs_gobp, file = file.path(enrichment_results_dir, "eQTMs_gobp.txt"))
+
+write.enrichment(DeQTMs_maps, file = file.path(enrichment_results_dir, "DeQTMs_maps.txt"))
+write.enrichment(DeQTMs_gobp, file = file.path(enrichment_results_dir, "DeQTMs_gobp.txt"))
+
+write.enrichment(DEGs_maps, file = file.path(enrichment_results_dir, "DEGs_maps.txt"))
+write.enrichment(DEGs_gobp, file = file.path(enrichment_results_dir, "DEGs_gobp.txt"))
+```
+
+```{r Interaction analyses}
+interactome <- load.interactome()
+
+aDMRs_int <- overconnected(aDMRs$Entrez, interactome)
+DE_aDMRs_int <- overconnected(DE_aDMRs$Entrez, interactome)
+eQTMs_int <- overconnected(eQTMs$Entrez, interactome)
+DeQTMs_int <- overconnected(DeQTMs$Entrez, interactome)
+
+write.overconnected(aDMRs_int, file = file.path(enrichment_results_dir, "aDMRs_overconnected.txt"))
+write.overconnected(DE_aDMRs_int, file = file.path(enrichment_results_dir, "DE_aDMRs_overconnected.txt"))
+write.overconnected(eQTMs_int, file = file.path(enrichment_results_dir, "eQTMs_overconnected.txt"))
+write.overconnected(DeQTMs_int, file = file.path(enrichment_results_dir, "DeQTMs_overconnected.txt"))
+```
+
+```{r Final}
+sessionInfo()
+save.image(file.path(enrichment_results_dir, "03_Enrichment_analyses.RData"))
+```

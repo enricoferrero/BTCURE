@@ -1,0 +1,158 @@
+---
+title: "Cellular enrichment"
+author: "Andrew Y.F. Li Yim"
+date: "August 2017"
+output:
+  pdf_document:
+      highlight: tango
+          number_sections: yes
+              toc: yes
+---
+
+```{r Filepaths}
+data_dir <- "../../data"
+primary_analyses_dir <- file.path(data_dir, "Primary_analyses")
+rnaseq_dir <- file.path(primary_analyses_dir, "data/analysis/RNAseq/00samples")
+
+output_dir <- "../../output"
+cellenr_dir <- file.path(output_dir, "05_Cellular_enrichment")
+salmon_dir <- file.path(cellenr_dir, "salmon_alignment")
+```
+
+```{r Import samples}
+samples <- read.csv(file.path(rnaseq_dir, "samples.txt"), sep = "\t", stringsAsFactors = F)
+samples$filepath <- file.path(salmon_dir, paste0("Sample_", samples$Sample), "quant.sf")
+rownames(samples) <- samples$Sample
+
+require(biomaRt)
+ENSBM <- useEnsembl(biomart = "ensembl", dataset = "hsapiens_gene_ensembl", version = 90)
+tx2gene <- getBM(attributes = c("ensembl_transcript_id", "hgnc_symbol"), mart = ENSBM)
+
+require(tximport)
+txi_transcript <- tximport(samples$filepath, type = "salmon", txOut = T, tx2gene = tx2gene)
+colnames(txi_transcript$counts) <- rownames(samples)
+txi_gene <- summarizeToGene(txi_transcript, tx2gene)
+```
+
+```{r CD247}
+cd247_dir <- file.path(cellenr_dir, "CD247")
+dir.create(cd247_dir)
+
+CD247_tx <- tx2gene[grep("CD247", tx2gene$hgnc_symbol),"ensembl_transcript_id"]
+txi_transcript$counts[CD247_tx,]
+
+require(ggplot2)
+transcript_plotter <- function(counts, txid, factor_interest){
+	tx_df <- data.frame(TPM = counts[txid,],
+			    Group = factor_interest)
+	plot_obj <- ggplot(data = tx_df, aes(x = Group, y = TPM)) +
+		geom_boxplot(aes(fill = Group), outlier.colour = NA) +
+		geom_jitter(size = 2, aes(shape = Group)) +
+		ggtitle(txid) +
+		theme_bw() +
+		xlab("") + 
+		theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+		      axis.text = element_text(size = 17), 
+		      axis.title = element_text(size = 17, face = "bold"), 
+		      legend.title = element_text(size = 17, face = "bold"), 
+		      legend.text = element_text(size = 17), 
+		      plot.title = element_text(face = "bold"))
+	print(plot_obj)	
+	return(plot_obj)	
+}
+
+lapply(CD247_tx, function(tx){ 
+	      pdf(file.path(cd247_dir, paste0(tx, ".pdf")), height = 4, width = 4) 
+	      transcript_plotter(counts = txi_transcript$counts, txid = tx, factor_interest = samples$Swelling)
+	      dev.off()
+	      png(file.path(cd247_dir, paste0(tx, ".png")), height = 700, width = 700, res = 150) 
+	      transcript_plotter(counts = txi_transcript$counts, txid = tx, factor_interest = samples$Swelling)
+	      dev.off()
+})
+
+```
+
+```{r xCell}
+celltype_dir <- file.path(cellenr_dir, "Celltypes")
+dir.create(celltype_dir)
+
+require(devtools)
+require(xCell)
+
+txi_xCell <- xCellAnalysis(txi_gene$counts)
+samples$Swelling <- factor(samples$Swelling, levels = c("None", "Low", "High"))
+
+xCell_stats <- apply(txi_xCell, 1, function(celltype){
+	lmp <- function(lm_object){
+		if(class(lm_object) != "lm") stop("Not an object of class 'lm' ")
+		f <- summary(lm_object)$fstatistic
+		p <- pf(f[1], f[2], f[3], lower.tail = F)
+		attributes(p) <- NULL
+		return(p)
+	}
+
+	lfit <- lm(celltype ~ samples$Swelling)
+	pwttest <- pairwise.t.test(celltype, samples$Swelling, pool.sd = T)$p.value
+
+	cell_stats <- data.frame(F = summary(lfit)$fstatistic[1],
+				 F.p = lmp(lfit),
+				 HvN = pwttest["High", "None"],
+				 HvL = pwttest["High", "Low"],
+				 LvN = pwttest["Low", "None"])
+	return(cell_stats)
+})
+xCell_stats <- do.call(rbind, xCell_stats)
+xCell_stats <- xCell_stats[order(xCell_stats$F.p),]
+xCell_stats$F.p.BH <- p.adjust(xCell_stats$F.p)
+xCell_stats <- xCell_stats[,sort(colnames(xCell_stats))]
+
+write.csv(txi_xCell, file.path(celltype_dir, "txi_xCell.csv"))
+write.csv(xCell_stats, file.path(celltype_dir, "xCell_stats.csv"))
+```
+
+```{r Visualization}
+#Separate
+sepplots_dir <- file.path(celltype_dir, "Separate")
+dir.create(sepplots_dir)
+
+require(ggplot2)
+for(i in 1:nrow(txi_xCell)){
+	plot_df <- data.frame(enrichment = txi_xCell[i,],
+			      severity = samples$Swelling)
+	plot_obj <- ggplot(plot_df, aes(x = severity, y = enrichment, shape = severity, col = severity)) +
+		geom_boxplot() +
+		geom_jitter() + 
+		ggtitle(paste0(rownames(txi_xCell)[i])) +
+		theme_bw()
+
+	png(file.path(sepplots_dir, paste0(rownames(txi_xCell)[i], ".png")), width = 800, height = 800, res = 150)
+	print(plot_obj)
+	dev.off()
+}
+
+#Together (top)
+togplots_dir <- file.path(celltype_dir, "Together")
+dir.create(togplots_dir)
+
+#top_cells <- xCell_stats[which(!rownames(xCell_stats) %in% c("MicroenvironmentScore", "ImmuneScore"))[1:10],]
+top_cells <- xCell_stats[which(!rownames(xCell_stats) %in% c("MicroenvironmentScore", "ImmuneScore"))[1:10],]
+top_cells <- top_cells[top_cells$F.p.BH < 0.05,]
+
+require(reshape2)
+top_txi_melt <- melt(txi_xCell[rownames(top_cells),])
+top_txi_melt$Swelling <- samples$Swelling[match(top_txi_melt$Var2, samples$Sample)]
+colnames(top_txi_melt) <- c("Cell", "Sample", "Enrichment", "Swelling")
+plot_obj <- ggplot(top_txi_melt, aes(x = Swelling, y = Enrichment, shape = Swelling)) +
+	theme_bw() +
+	geom_boxplot(outlier.colour = NA) +
+	geom_jitter() + 
+	facet_wrap(~ Cell, ncol = 5, scales = "free")
+
+png(file.path(togplots_dir, "top_differential_cells.png"), width = 1600, height = 800, res = 150)
+print(plot_obj)
+dev.off()
+
+pdf(file.path(togplots_dir, "top_differential_cells.pdf"), width = 7, height = 4)
+print(plot_obj)
+dev.off()
+```
